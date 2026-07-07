@@ -19,6 +19,36 @@ NVIDIA GPUs. Override it with:
 VLLM_JETSPEC_TORCH_FLOAT32_MATMUL_PRECISION=highest|high|medium|off
 ```
 
+## Run in the official vLLM container
+
+You can run the plugin from the official vLLM image without cloning this repo on
+the host or bind-mounting the source tree. Override the container command with a
+small bootstrap that clones the repo inside the container, installs only the
+wrapper dependencies missing from the vLLM image, and starts the supervisor:
+
+```shell
+docker run --rm --gpus all --ipc=host --shm-size 16g \
+  -p 30006:30006 \
+  -v vllm-jetspec-data:/data/vllm_dflash \
+  -v hf-cache:/root/.cache/huggingface \
+  -e HF_TOKEN \
+  -e VLLM_JETSPEC_MODEL=Qwen/Qwen3-8B \
+  -e VLLM_JETSPEC_SPEC_METHOD=plugin_hybrid \
+  --entrypoint /bin/bash \
+  vllm/vllm-openai:latest \
+  -lc 'git clone --depth 1 --branch main https://github.com/flozi00/vllm-self-spec.git /opt/vllm_dflash_jit &&
+       python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
+         "fastapi>=0.115.0" "httpx>=0.28.0" "uvicorn>=0.34.0" \
+         "huggingface_hub>=0.20.0" arctic-inference &&
+       ln -sf /opt/vllm_dflash_jit/sitecustomize.py /opt/sitecustomize.py &&
+       export PYTHONPATH=/opt &&
+       exec python -m vllm_dflash_jit.app'
+```
+
+Replace `VLLM_JETSPEC_MODEL` and the repo branch with the model and revision you
+want to run. The mounted volumes above persist runtime data and Hugging Face
+cache only; the plugin source is cloned inside each container start.
+
 ## Speculation Modes
 
 Plugin hybrid is the default low-latency path for live traffic:
