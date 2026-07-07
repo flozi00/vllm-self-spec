@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+*.so
+*.dylib
+*.dll
+
+# Rust
+target/
+
+# Local Codex / graphify state
+.codex/
+graphify-out/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
