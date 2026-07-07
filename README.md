@@ -153,6 +153,26 @@ curl -X POST 'http://127.0.0.1:<public-port>/jit/checkpoints/sync?direction=down
 curl -X POST 'http://127.0.0.1:<public-port>/jit/checkpoints/sync?direction=upload'
 ```
 
+Backfill an existing promoted checkpoint directory:
+
+```shell
+export VLLM_JETSPEC_HF_CHECKPOINT_REPO=namespace/private-spec-checkpoints
+export VLLM_JETSPEC_HF_CHECKPOINT_CREATE_REPO=true
+export VLLM_JETSPEC_HF_CHECKPOINT_REPO_PRIVATE=true
+export HF_TOKEN=<token with write access>
+
+python -m vllm_dflash_jit.hub_checkpoints upload \
+  --model-name base/model \
+  --served-model-name smolagent \
+  --checkpoint-dir /path/to/checkpoints/base--model
+```
+
+The command uploads the checkpoint referenced by
+`<checkpoint-dir>/latest.json` first, then uploads the sanitized `latest.json`.
+Other deployments reuse it by setting the same
+`VLLM_JETSPEC_HF_CHECKPOINT_REPO` and served model name, or the same explicit
+`VLLM_JETSPEC_HF_CHECKPOINT_PATH_PREFIX`.
+
 Useful knobs:
 
 ```shell

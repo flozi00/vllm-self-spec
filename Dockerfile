@@ -7,6 +7,7 @@ RUN python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
     "fastapi>=0.115.0" \
     "httpx>=0.28.0" \
     "uvicorn>=0.34.0" \
+    "huggingface_hub>=0.20.0" \
     arctic-inference
 
 RUN mkdir -p /opt/vllm_dflash_jit

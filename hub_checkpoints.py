@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import json
 import os
@@ -431,3 +432,69 @@ def _hf_hub_download(**kwargs: Any) -> str:
     from huggingface_hub import hf_hub_download
 
     return hf_hub_download(**kwargs)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Backfill promoted JetSpec checkpoints to Hugging Face Hub."
+    )
+    parser.add_argument("--self-check", action="store_true", help=argparse.SUPPRESS)
+    subparsers = parser.add_subparsers(dest="command")
+    upload = subparsers.add_parser(
+        "upload", help="upload checkpoint-dir/latest.json and its checkpoint"
+    )
+    upload.add_argument("--model-name", required=True)
+    upload.add_argument("--served-model-name")
+    upload.add_argument("--checkpoint-dir", required=True, type=Path)
+    return parser
+
+
+def _upload_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    config = config_from_env(args.model_name, served_model_name=args.served_model_name)
+    return upload_latest_checkpoint(
+        model_name=args.model_name,
+        checkpoint_dir=args.checkpoint_dir,
+        config=config,
+    )
+
+
+def _self_check() -> None:
+    parser = _build_parser()
+    try:
+        parser.parse_args(["--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    old_env = os.environ.copy()
+    try:
+        os.environ.clear()
+        os.environ.update(
+            {
+                "VLLM_JETSPEC_HF_CHECKPOINT_REPO": "namespace/private-spec-checkpoints",
+            }
+        )
+        config = config_from_env("base/model", served_model_name="smolagent")
+        assert config is not None
+        assert config.private is True
+        assert config.path_prefix == "smolagent"
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.self_check:
+        _self_check()
+        return 0
+    if args.command == "upload":
+        result = _upload_from_args(args)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 1 if result.get("status") == "failed" else 0
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

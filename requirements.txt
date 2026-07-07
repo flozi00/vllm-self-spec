@@ -1,7 +1,7 @@
 fastapi>=0.115.0
 httpx>=0.28.0
 uvicorn>=0.34.0
+huggingface_hub>=0.20.0
 transformers>=5.5.0
 torch>=2.8.0
 arctic-inference
-
