@@ -1,1 +1,1 @@
-"""JIT JetSpec speculation helpers for a vLLM development service."""
+"""Colocated vLLM inference and LoRA training in one container."""

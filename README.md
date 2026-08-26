@@ -1,317 +1,248 @@
-# vLLM JIT JetSpec Service
+# vLLM Colocate: Inference + LoRA Training in One Container
 
-This wrapper is now intentionally narrow:
+One container, one base model, two GPU halves:
 
-- launch `vllm serve` behind the existing OpenAI-compatible proxy
-- enable low-latency speculative decoding with suffix decoding, JetSpec, or the hybrid plugin
-- record real inference traffic and token traces for suffix reuse
-- expose explicit routes for manager-triggered JetSpec and live LoRA training
-- accept live SFT/DPO samples for raw-torch LoRA training
-- expose concise `/jit/*` status and metrics endpoints
+- **Inference**: vLLM serves the base model directly on the public inference
+  port (default `8000`) using half of the visible GPUs. There is no proxy in
+  front of it — clients talk straight to vLLM's OpenAI-compatible API.
+- **Training**: the other half of the GPUs runs LoRA training jobs (SFT, DPO,
+  or KTO) submitted through a small control-plane API (default `8001`).
+  Training samples are provided in the request body — traces and training data
+  are generated elsewhere; this service only trains and serves.
+- **Fast weight sync**: after each training job finishes (or is stopped with
+  checkpoints written), the exported PEFT adapter is loaded into the running
+  vLLM server via `/v1/load_lora_adapter`. No restart, no model reload —
+  inference requests keep flowing the whole time.
 
-It does not generate synthetic data, patch model code, patch vLLM kernels, or
-install model-specific monkey patches. The mounted `sitecustomize.py` only sets
-Torch runtime defaults for performance; by default it calls
-`torch.set_float32_matmul_precision("high")` to enable TF32 matmul on supported
-NVIDIA GPUs. Override it with:
+Because inference and training own disjoint GPUs, inference requests and
+training jobs run concurrently. There is no sleep/wake handoff and no request
+queueing during training.
 
-```shell
-VLLM_JETSPEC_TORCH_FLOAT32_MATMUL_PRECISION=highest|high|medium|off
+## Architecture
+
+```
+                       ┌────────────────────────────────────────────┐
+ inference clients ───►│ :8000  vllm serve (GPUs 0..N/2-1)          │
+                       │        --enable-lora, runtime LoRA updates │
+                       │              ▲                             │
+                       │              │ /v1/load_lora_adapter       │
+ training clients ────►│ :8001  control plane (FastAPI)             │
+                       │        └► lora_trainer.py subprocess       │
+                       │           (GPUs N/2..N-1, raw-torch LoRA)  │
+                       └────────────────────────────────────────────┘
 ```
 
-## Run in the official vLLM container
+The trainer is a self-contained raw-torch process (`lora_trainer.py`): it
+loads the same checkpoint vLLM serves through Transformers, injects LoRA
+modules, trains with SFT/DPO/KTO losses, and exports a PEFT-format adapter
+directory (`adapter_config.json` + `adapter_model.safetensors`) that vLLM can
+load at runtime. DPO and KTO reference log-probabilities come from the same
+model with LoRA disabled — no second model copy is needed. Jobs run
+sequentially; each job resumes from the latest adapter checkpoint, so training
+is cumulative across jobs.
 
-You can run the plugin from the official vLLM image without cloning this repo on
-the host or bind-mounting the source tree. Override the container command with a
-small bootstrap that clones the repo inside the container, installs only the
-wrapper dependencies missing from the vLLM image, and starts the supervisor:
+## Run
 
 ```shell
 docker run --rm --gpus all --ipc=host --shm-size 16g \
-  -p 30006:30006 \
-  -v vllm-jetspec-data:/data/vllm_dflash \
+  -p 8000:8000 -p 8001:8001 \
+  -v vllm-colocate-data:/data/vllm_colocate \
   -v hf-cache:/root/.cache/huggingface \
   -e HF_TOKEN \
-  -e VLLM_JETSPEC_MODEL=Qwen/Qwen3-8B \
-  -e VLLM_JETSPEC_SPEC_METHOD=plugin_hybrid \
+  -e VLLM_COLOCATE_MODEL=Qwen/Qwen3-8B \
+  <image>
+```
+
+Or from the official vLLM image without building:
+
+```shell
+docker run --rm --gpus all --ipc=host --shm-size 16g \
+  -p 8000:8000 -p 8001:8001 \
+  -v vllm-colocate-data:/data/vllm_colocate \
+  -v hf-cache:/root/.cache/huggingface \
+  -e HF_TOKEN \
+  -e VLLM_COLOCATE_MODEL=Qwen/Qwen3-8B \
   --entrypoint /bin/bash \
   vllm/vllm-openai:latest \
-  -lc 'git clone --depth 1 --branch main https://github.com/flozi00/vllm-self-spec.git /opt/vllm_dflash_jit &&
+  -lc 'git clone --depth 1 --branch main https://github.com/flozi00/vllm-self-spec.git /opt/vllm_colocate &&
        python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
          "fastapi>=0.115.0" "httpx>=0.28.0" "uvicorn>=0.34.0" \
-         "huggingface_hub>=0.20.0" arctic-inference &&
-       ln -sf /opt/vllm_dflash_jit/sitecustomize.py /opt/sitecustomize.py &&
+         "huggingface_hub>=0.20.0" "safetensors>=0.4.0" &&
        export PYTHONPATH=/opt &&
-       exec python -m vllm_dflash_jit.app'
+       exec python -m vllm_colocate.app'
 ```
 
-Replace `VLLM_JETSPEC_MODEL` and the repo branch with the model and revision you
-want to run. The mounted volumes above persist runtime data and Hugging Face
-cache only; the plugin source is cloned inside each container start.
+## GPU partitioning
 
-## Speculation Modes
-
-Plugin hybrid is the default low-latency path for live traffic:
+By default the visible GPUs are split in half: inference gets the first half
+(rounded up), training the rest. On an 8-GPU host, vLLM runs with
+`--tensor-parallel-size 4` on GPUs `0-3` and training uses GPUs `4-7`.
+Override the split explicitly:
 
 ```shell
-VLLM_JETSPEC_SPEC_METHOD=plugin_hybrid
+VLLM_COLOCATE_INFERENCE_GPUS=0,1
+VLLM_COLOCATE_TRAINING_GPUS=2,3
+VLLM_COLOCATE_TENSOR_PARALLEL_SIZE=2   # defaults to len(inference GPUs)
 ```
 
-That maps to vLLM's `custom_class` speculative API:
+On a single-GPU host both roles share the device; GPU memory utilization for
+vLLM then defaults to `0.45` instead of `0.90` so training has headroom.
+Multi-GPU training uses Transformers `device_map=auto` model parallelism
+inside the trainer subprocess automatically.
+
+## Inference
+
+Plain vLLM, served directly:
+
+```shell
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model": "Qwen/Qwen3-8B", "messages": [{"role": "user", "content": "Hi"}]}'
+```
+
+The trained adapter is served under its own model name (default
+`<served-model-name>-lora`). After the first weight sync:
+
+```shell
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model": "Qwen/Qwen3-8B-lora", "messages": [{"role": "user", "content": "Hi"}]}'
+```
+
+Requesting the base model name always hits the untuned weights; requesting the
+adapter name hits the latest synced adapter. `GET :8000/v1/models` lists both.
+
+## Training
+
+Submit jobs with samples inline. Each request creates one job; jobs queue and
+run one at a time on the training GPUs. Add `?wait=true` (optionally with
+`wait_timeout_seconds=...`) to block until the job finishes.
+
+SFT — `prompt`+`completion`, chat `messages` (last assistant turn is the
+target), or raw `text`:
+
+```shell
+curl -X POST http://127.0.0.1:8001/train/sft \
+  -H 'content-type: application/json' \
+  -d '{"samples": [{"prompt": "Question", "completion": "Answer"}]}'
+```
+
+DPO — `prompt` (or `messages`) with `chosen` and `rejected`:
+
+```shell
+curl -X POST http://127.0.0.1:8001/train/dpo \
+  -H 'content-type: application/json' \
+  -d '{"samples": [{"prompt": "Question", "chosen": "Better", "rejected": "Worse"}]}'
+```
+
+KTO — `prompt` (or `messages`), `completion`, and a boolean `label`
+(`true` = desirable, `false` = undesirable; `desirable` is accepted as an
+alias):
+
+```shell
+curl -X POST http://127.0.0.1:8001/train/kto \
+  -H 'content-type: application/json' \
+  -d '{"samples": [
+        {"prompt": "Question", "completion": "Good answer", "label": true},
+        {"prompt": "Question", "completion": "Bad answer", "label": false}
+      ]}'
+```
+
+Per-job hyperparameter overrides go in `options`:
 
 ```json
 {
-  "method": "custom_class",
-  "model": "vllm_dflash_jit.hybrid_proposer.HybridSuffixJetSpecProposer",
-  "num_speculative_tokens": 8
+  "samples": [...],
+  "options": {"max_steps": 50, "learning_rate": 1e-4, "kto_beta": 0.1}
 }
 ```
 
-The hybrid proposer gives the CPU suffix cache the draft budget first, then uses
-the latest local JetSpec adapter checkpoint to fill remaining draft slots. Stats
-are written to `VLLM_JETSPEC_PROPOSER_STATS_PATH` and surfaced through
-`/jit/speculation_metrics`.
+Allowed options: `max_steps`, `train_epochs`, `batch_size`,
+`gradient_accumulation_steps`, `max_seq_len`, `learning_rate`,
+`weight_decay`, `max_grad_norm`, `dpo_beta`, `kto_beta`,
+`kto_desirable_weight`, `kto_undesirable_weight`, `loss_vocab_sample_size`.
 
-Native suffix decoding remains available:
-
-```shell
-VLLM_JETSPEC_SPEC_METHOD=suffix
-```
-
-Native JetSpec tree drafting is available when the deployed vLLM image is the
-JetSpec vLLM fork:
+Job lifecycle:
 
 ```shell
-VLLM_JETSPEC_SPEC_METHOD=jetspec
+curl http://127.0.0.1:8001/train/jobs                  # recent jobs
+curl http://127.0.0.1:8001/train/jobs/<job-id>          # one job
+curl -X POST http://127.0.0.1:8001/train/jobs/<job-id>/cancel
+curl http://127.0.0.1:8001/train/metrics?limit=50       # trainer step metrics
 ```
 
-The current JetSpec fork exposes its runtime through vLLM's `method: "dflash"`
-speculative-config key, so this wrapper still emits that method name for native
-JetSpec mode only.
+Job statuses: `queued`, `running`, `succeeded`, `failed`, `canceled`. A
+canceled or failed job that still wrote checkpoints has its partial progress
+synced (the checkpoint step advanced, so the adapter export is valid).
 
-## Draft Heads
+## Weight sync
 
-Native JetSpec draft-head resolution is local-first:
-
-1. `VLLM_JETSPEC_DRAFT_HEAD`, `VLLM_JETSPEC_DRAFT_MODEL`, or `JETSPEC_DRAFT_HEAD`
-2. `VLLM_JETSPEC_DRAFT_HEAD_DIR` or `VLLM_JETSPEC_DRAFT_MODEL_DIR`
-3. `<VLLM_JETSPEC_CHECKPOINT_ROOT>/<base-model-slug>/jetspec`
-4. `VLLM_JETSPEC_PRETRAINED_DRAFT_HEAD` or `VLLM_JETSPEC_PRETRAINED_DRAFT_MODEL`
-5. the built-in JetSpec model-zoo mapping for supported public heads
-
-The built-in trainer writes the small local adapter `.pt` format used by
-the plugin hybrid proposer. Native JetSpec draft-head training should be wired
-through `VLLM_JETSPEC_TRAINER_COMMAND` so an external trainer can write a Hugging
-Face draft-head directory.
-
-## Manager-Triggered JetSpec Training
-
-The wrapper never schedules training on its own, including when the GPU is idle.
-Only an explicit API request to `/jit/train/jetspec` may start JetSpec training.
-A manager proxy should decide when to pause inference, sleep vLLM, and trigger
-JetSpec training:
+After every job whose checkpoint step advanced, the control plane loads the
+exported adapter into vLLM: unload the stable adapter name, then load the new
+versioned adapter directory under the same name. Adapter exports are
+versioned (`adapter-step-<n>/`), so a load never races a directory being
+rewritten. The active adapter is re-synced automatically after a vLLM restart.
 
 ```shell
-curl -X POST 'http://127.0.0.1:<public-port>/jit/sleep'
-curl -X POST 'http://127.0.0.1:<public-port>/jit/train/jetspec?wait=true'
-curl -X POST 'http://127.0.0.1:<public-port>/jit/wake'
+curl http://127.0.0.1:8001/adapter          # current adapter state
+curl -X POST http://127.0.0.1:8001/adapter/sync   # force a re-sync
 ```
-
-The trainer stores `training_state.json` under the model checkpoint directory
-and skips unchanged data on later manually triggered cycles unless `force=true`
-is passed.
-
-## Hub Checkpoint Sync
-
-Set `VLLM_JETSPEC_HF_CHECKPOINT_REPO=<namespace>/<repo>` to mirror promoted
-JetSpec adapter checkpoints through Hugging Face Hub. The wrapper uses the
-served-model slug as the repo path prefix by default, so the Hub checkpoint name
-follows the public deployment contract rather than the backing base model. For
-example, a service with `VLLM_JETSPEC_SERVED_MODEL_NAME=smolagent` writes
-`smolagent/latest.json` and `smolagent/checkpoint-step-...pt`.
-
-Only the promoted adapter checkpoint and a sanitized `latest.json` are synced.
-Traffic files, live training rows, suffix caches, and `training_state.json` are
-not uploaded. The Hub `latest.json` allowlist is:
-
-```json
-{
-  "checkpoint": "checkpoint-step-00000042.pt",
-  "checkpoint_path": "checkpoint-step-00000042.pt",
-  "step": 42,
-  "saved_at": 1710000000.0,
-  "model_name": "base/model",
-  "num_speculative_tokens": 8,
-  "quality": {"exact_prefix_mean": 0.5},
-  "hub_repo_id": "namespace/repo",
-  "hub_path_prefix": "smolagent",
-  "hub_revision": "main",
-  "uploaded_at": 1710000001.0
-}
-```
-
-Minimum config:
-
-```shell
-VLLM_JETSPEC_HF_CHECKPOINT_REPO=namespace/private-spec-checkpoints
-HF_TOKEN=<token with read/write access>
-```
-
-Defaults when the repo is set:
-
-```shell
-VLLM_JETSPEC_HF_CHECKPOINT_REVISION=main
-VLLM_JETSPEC_HF_CHECKPOINT_DOWNLOAD=true
-VLLM_JETSPEC_HF_CHECKPOINT_UPLOAD=true
-VLLM_JETSPEC_HF_CHECKPOINT_SYNC_ON_INFERENCE=true
-VLLM_JETSPEC_HF_CHECKPOINT_SYNC_INTERVAL_SECONDS=300
-VLLM_JETSPEC_HF_CHECKPOINT_CREATE_REPO=false
-VLLM_JETSPEC_HF_CHECKPOINT_REPO_PRIVATE=true
-```
-
-Only set `VLLM_JETSPEC_HF_CHECKPOINT_PATH_PREFIX` when the served model name is
-not the Hub folder name you want.
-
-Download checks run before `/jit/train/jetspec`, before `/jit/sleep`, and in the
-background during inference no more often than the configured interval. After a
-successful promoted training checkpoint, the wrapper uploads the `.pt` first and
-then uploads `latest.json`, so other nodes only see a new version after its
-weights are present. Operators can force a sync explicitly:
-
-```shell
-curl -X POST 'http://127.0.0.1:<public-port>/jit/checkpoints/sync?direction=download&force=true'
-curl -X POST 'http://127.0.0.1:<public-port>/jit/checkpoints/sync?direction=upload'
-```
-
-Backfill an existing promoted checkpoint directory:
-
-```shell
-export VLLM_JETSPEC_HF_CHECKPOINT_REPO=namespace/private-spec-checkpoints
-export VLLM_JETSPEC_HF_CHECKPOINT_CREATE_REPO=true
-export VLLM_JETSPEC_HF_CHECKPOINT_REPO_PRIVATE=true
-export HF_TOKEN=<token with write access>
-
-python -m vllm_dflash_jit.hub_checkpoints upload \
-  --model-name base/model \
-  --served-model-name smolagent \
-  --checkpoint-dir /path/to/checkpoints/base--model
-```
-
-The command uploads the checkpoint referenced by
-`<checkpoint-dir>/latest.json` first, then uploads the sanitized `latest.json`.
-Other deployments reuse it by setting the same
-`VLLM_JETSPEC_HF_CHECKPOINT_REPO` and served model name, or the same explicit
-`VLLM_JETSPEC_HF_CHECKPOINT_PATH_PREFIX`.
-
-Useful knobs:
-
-```shell
-VLLM_JETSPEC_TRAINING_ENABLED=false
-VLLM_JETSPEC_TRAIN_STEPS=0
-VLLM_JETSPEC_TRAIN_EPOCHS=1
-VLLM_JETSPEC_MAX_EXAMPLES_PER_TRAFFIC=0
-```
-
-`VLLM_JETSPEC_TRAINING_ENABLED=false` keeps legacy idle schedulers disabled;
-the explicit `/jit/train/jetspec` API route still owns JetSpec training.
-`VLLM_JETSPEC_TRAIN_STEPS=0` auto-sizes each route-triggered run to a full pass
-over the built examples. While an explicit trainer route owns the GPUs,
-OpenAI-compatible inference requests return a retryable `503` instead of
-implicitly stopping the trainer. Use `/jit/wake` or stop the trainer route from
-the manager if inference should take priority.
-
-## Live SFT/DPO LoRA Training
-
-Live model training uses durable JSONL at
-`VLLM_JETSPEC_LIVE_TRAIN_DATA_PATH` and a separate
-`<checkpoint-dir>/live_lora` checkpoint tree. It does not use TRL, VERL, or a
-trainer framework: the built-in trainer uses Transformers only as the
-autograd-capable PyTorch model/remote-code loader for the same checkpoint that
-vLLM serves. It injects LoRA modules in raw torch, supports SFT and DPO losses,
-and defaults to model-parallel loading for tensor-parallel-served models. The
-running vLLM model is not mutated in-place; vLLM's inference workers do not
-expose a backward/optimizer API through the OpenAI or tokenizer routes.
-
-For quantized serving checkpoints, keep `VLLM_JETSPEC_MODEL` pointed at the
-served model. The live trainer fine-tunes a LoRA adapter against that same
-checkpoint and includes a raw-torch ModelOpt/NVFP4 fallback for packed expert
-weights whose on-disk tensors are stored as two FP4 values per byte.
-
-Append SFT samples:
-
-```shell
-curl -X POST http://127.0.0.1:<public-port>/jit/train/sft \
-  -H 'content-type: application/json' \
-  -d '{"samples":[{"prompt":"Question","completion":"Answer"}]}'
-```
-
-Append DPO samples:
-
-```shell
-curl -X POST http://127.0.0.1:<public-port>/jit/train/dpo \
-  -H 'content-type: application/json' \
-  -d '{"samples":[{"prompt":"Question","chosen":"Better answer","rejected":"Worse answer"}]}'
-```
-
-Trigger LoRA training explicitly after appending samples:
-
-```shell
-curl -X POST 'http://127.0.0.1:<public-port>/jit/sleep'
-curl -X POST 'http://127.0.0.1:<public-port>/jit/train/live_lora?wait=true'
-curl -X POST 'http://127.0.0.1:<public-port>/jit/wake'
-```
-
-While live LoRA training is running, inference requests are rejected with a
-retryable `503` response. The manager proxy should drain or reroute users before
-calling `/jit/train/live_lora`; the wrapper does not decide when idle training
-should happen.
-
-When
-`VLLM_JETSPEC_LIVE_LORA_SERVING_ENABLED=true`, the active adapter is loaded into
-vLLM through its LoRA endpoint and the proxy rewrites public requests for the
-served model name to the active adapter name, preserving the client-facing model
-contract. Keep that serving flag off for vLLM/model/quantization combinations
-that do not initialize with `--enable-lora`; training still checkpoints the
-adapter for later promotion.
-
-Useful knobs:
-
-```shell
-VLLM_JETSPEC_LIVE_TRAINING_ENABLED=true
-VLLM_JETSPEC_LIVE_LORA_SERVING_ENABLED=false
-VLLM_JETSPEC_LIVE_TRAIN_PARALLEL_MODE=auto
-VLLM_JETSPEC_LIVE_TRAIN_QUANTIZATION=auto
-VLLM_JETSPEC_LIVE_LORA_R=16
-VLLM_JETSPEC_LIVE_INCLUDE_EXPERT_LORA=false
-VLLM_JETSPEC_LIVE_MAX_SEQ_LEN=2048
-VLLM_JETSPEC_LIVE_LOSS_VOCAB_SAMPLE_SIZE=0
-```
-
-`loss_vocab_sample_size` can also be passed to `/jit/train/live_lora`; `0` uses
-the exact full-vocabulary loss, while a positive value uses a deterministic
-sampled-token loss that is useful for tiny route smoke tests on very large
-vocabularies.
 
 ## Observability
 
 ```shell
-curl http://127.0.0.1:<public-port>/jit/status
-curl http://127.0.0.1:<public-port>/jit/training_metrics?limit=50
-curl http://127.0.0.1:<public-port>/jit/speculation_metrics
-curl http://127.0.0.1:<public-port>/jit/train/data
+curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8001/status
 ```
 
-`/jit/status` includes traffic row counts, external scheduler state, latest
-trainer progress, latest checkpoint metadata, suffix-cache state, and vLLM
-speculative metrics when the runtime exposes them.
+`/status` reports the GPU partition, vLLM process/readiness state, loaded
+model names, the training queue, the latest checkpoint, and the active
+adapter. vLLM's own metrics stay on the inference port (`:8000/metrics`).
 
-## Rust Suffix Backend
+## Configuration reference
 
-The hot suffix proposal loop can use the optional Rust/PyO3 backend. If the
-extension is absent, the Python implementation is used.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VLLM_COLOCATE_MODEL` | `Qwen/Qwen3-8B` | Base model to serve and train |
+| `VLLM_COLOCATE_SERVED_MODEL_NAME` | model name | Public model name in vLLM |
+| `VLLM_COLOCATE_LORA_ADAPTER_NAME` | `<served>-lora` | Adapter model name |
+| `VLLM_COLOCATE_INFERENCE_PORT` | `8000` | vLLM port |
+| `VLLM_COLOCATE_API_PORT` | `8001` | Control-plane port |
+| `VLLM_COLOCATE_INFERENCE_GPUS` | first half | Explicit inference GPU ids |
+| `VLLM_COLOCATE_TRAINING_GPUS` | second half | Explicit training GPU ids |
+| `VLLM_COLOCATE_TENSOR_PARALLEL_SIZE` | #inference GPUs | vLLM tensor parallelism |
+| `VLLM_COLOCATE_GPU_MEMORY_UTILIZATION` | `0.90` (`0.45` shared) | vLLM GPU memory fraction |
+| `VLLM_COLOCATE_MAX_MODEL_LEN` | model default | vLLM `--max-model-len` |
+| `VLLM_COLOCATE_MAX_NUM_SEQS` | vLLM default | vLLM `--max-num-seqs` |
+| `VLLM_COLOCATE_MAX_LORAS` | `1` | vLLM `--max-loras` |
+| `VLLM_COLOCATE_MAX_LORA_RANK` | `max(16, LORA_R)` | vLLM `--max-lora-rank` |
+| `VLLM_COLOCATE_VLLM_EXTRA_ARGS` | empty | Extra `vllm serve` args |
+| `VLLM_COLOCATE_DATA_DIR` | `/data/vllm_colocate` | Jobs, checkpoints, metrics |
+| `VLLM_COLOCATE_LORA_R` / `_LORA_ALPHA` / `_LORA_DROPOUT` | `16` / `32` / `0.05` | LoRA shape |
+| `VLLM_COLOCATE_LORA_TARGET_MODULES` | attn+mlp projections | LoRA injection targets |
+| `VLLM_COLOCATE_TRAIN_STEPS` / `_TRAIN_EPOCHS` | `0` / `1` | Default steps (0 = full pass) |
+| `VLLM_COLOCATE_BATCH_SIZE` / `_GRADIENT_ACCUMULATION_STEPS` | `1` / `1` | Batch shape |
+| `VLLM_COLOCATE_MAX_SEQ_LEN` | `2048` | Trainer sequence length |
+| `VLLM_COLOCATE_LR` | `2e-4` | Learning rate |
+| `VLLM_COLOCATE_DPO_BETA` | `0.1` | DPO beta |
+| `VLLM_COLOCATE_KTO_BETA` | `0.1` | KTO beta |
+| `VLLM_COLOCATE_KTO_DESIRABLE_WEIGHT` / `_KTO_UNDESIRABLE_WEIGHT` | `1.0` / `1.0` | KTO loss weights |
+| `VLLM_COLOCATE_TRAIN_QUANTIZATION` | `auto` | NVFP4/FP-quant training support |
+| `VLLM_COLOCATE_TRUST_REMOTE_CODE` | `true` | Trust remote code |
+| `VLLM_COLOCATE_SYNC_ON_STARTUP` | `true` | Re-sync adapter after vLLM (re)start |
+| `VLLM_COLOCATE_CANCEL_GRACE_SECONDS` | `30` | Cancel grace before SIGTERM |
 
-```shell
-cd services/vllm_dflash_jit/rust_suffix_backend
-cargo build --release
-cp target/release/lib_vllm_dflash_jit_rust.so ../_vllm_dflash_jit_rust.so
-```
+Quantized base checkpoints (ModelOpt/NVFP4 packed weights) are supported in
+training through a raw-torch dequantization fallback, controlled by
+`VLLM_COLOCATE_TRAIN_QUANTIZATION` (`auto` enables it when the model name
+contains `nvfp4`).
+
+## Notes and limits
+
+- The DPO/KTO reference distribution is the base model (adapter disabled),
+  also when a job resumes from an earlier adapter.
+- One adapter is trained cumulatively; per-job `lora_r` changes are not
+  supported (the adapter shape is fixed by the environment).
+- Training data is job-scoped: samples are stored under
+  `VLLM_COLOCATE_DATA_DIR/jobs/<job-id>.jsonl` for reproducibility, but no
+  traffic or message tracking of inference requests happens anywhere.
