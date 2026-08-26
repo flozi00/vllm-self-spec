@@ -82,8 +82,15 @@ Override the split explicitly:
 ```shell
 VLLM_COLOCATE_INFERENCE_GPUS=0,1
 VLLM_COLOCATE_TRAINING_GPUS=2,3
-VLLM_COLOCATE_TENSOR_PARALLEL_SIZE=2   # defaults to len(inference GPUs)
+VLLM_COLOCATE_TENSOR_PARALLEL_SIZE=2
 ```
+
+Tensor parallelism defaults to the largest power of two that fits the
+inference half (attention-head counts rarely divide by 3), so a 6-GPU host
+gets 3 inference GPUs with TP 2 unless you override it. Explicit GPU lists
+must use the same identifiers the container sees (indices from `nvidia-smi`,
+or the tokens of `CUDA_VISIBLE_DEVICES` if that is set); unknown ids fail at
+startup instead of silently overlapping the two halves.
 
 On a single-GPU host both roles share the device; GPU memory utilization for
 vLLM then defaults to `0.45` instead of `0.90` so training has headroom.
@@ -215,7 +222,7 @@ adapter. vLLM's own metrics stay on the inference port (`:8000/metrics`).
 | `VLLM_COLOCATE_MAX_MODEL_LEN` | model default | vLLM `--max-model-len` |
 | `VLLM_COLOCATE_MAX_NUM_SEQS` | vLLM default | vLLM `--max-num-seqs` |
 | `VLLM_COLOCATE_MAX_LORAS` | `1` | vLLM `--max-loras` |
-| `VLLM_COLOCATE_MAX_LORA_RANK` | `max(16, LORA_R)` | vLLM `--max-lora-rank` |
+| `VLLM_COLOCATE_MAX_LORA_RANK` | `max(16, LORA_R)` rounded up to a rank vLLM accepts | vLLM `--max-lora-rank` |
 | `VLLM_COLOCATE_VLLM_EXTRA_ARGS` | empty | Extra `vllm serve` args |
 | `VLLM_COLOCATE_DATA_DIR` | `/data/vllm_colocate` | Jobs, checkpoints, metrics |
 | `VLLM_COLOCATE_LORA_R` / `_LORA_ALPHA` / `_LORA_DROPOUT` | `16` / `32` / `0.05` | LoRA shape |
@@ -231,6 +238,17 @@ adapter. vLLM's own metrics stay on the inference port (`:8000/metrics`).
 | `VLLM_COLOCATE_TRUST_REMOTE_CODE` | `true` | Trust remote code |
 | `VLLM_COLOCATE_SYNC_ON_STARTUP` | `true` | Re-sync adapter after vLLM (re)start |
 | `VLLM_COLOCATE_CANCEL_GRACE_SECONDS` | `30` | Cancel grace before SIGTERM |
+| `VLLM_COLOCATE_INFERENCE_HOST` / `_API_HOST` | `0.0.0.0` | Bind hosts for vLLM / control plane |
+| `VLLM_COLOCATE_CHECKPOINT_DIR` | `<data>/checkpoints/<model>` | Checkpoint + adapter export dir |
+| `VLLM_COLOCATE_JOBS_DIR` | `<data>/jobs` | Per-job sample JSONL dir |
+| `VLLM_COLOCATE_METRICS_PATH` | `<data>/trainer_metrics.jsonl` | Trainer step-metrics file |
+| `VLLM_COLOCATE_READY_TIMEOUT_SECONDS` | `1800` | vLLM readiness timeout |
+| `VLLM_COLOCATE_WEIGHT_DECAY` / `_MAX_GRAD_NORM` | `0` / `1` | Optimizer defaults (per-job overridable) |
+| `VLLM_COLOCATE_TORCH_DTYPE` | `bfloat16` | Trainer compute dtype |
+| `VLLM_COLOCATE_CHECKPOINT_EVERY` | `16` | Steps between adapter exports (sync granularity) |
+| `VLLM_COLOCATE_KEEP_LAST_CHECKPOINTS` | `2` | Checkpoint/adapter versions retained |
+| `VLLM_COLOCATE_SAVE_OPTIMIZER_STATE` | `true` | Save optimizer state in checkpoints |
+| `VLLM_COLOCATE_LOG_LEVEL` | `INFO` | Log level (supervisor and trainer) |
 
 Quantized base checkpoints (ModelOpt/NVFP4 packed weights) are supported in
 training through a raw-torch dequantization fallback, controlled by
@@ -240,7 +258,8 @@ contains `nvfp4`).
 ## Notes and limits
 
 - The DPO/KTO reference distribution is the base model (adapter disabled),
-  also when a job resumes from an earlier adapter.
+  also when a job resumes from an earlier adapter. Both losses use summed
+  completion log-probabilities, matching the DPO/KTO papers and TRL.
 - One adapter is trained cumulatively; per-job `lora_r` changes are not
   supported (the adapter shape is fixed by the environment).
 - Training data is job-scoped: samples are stored under

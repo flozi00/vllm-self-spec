@@ -41,6 +41,8 @@ logger = logging.getLogger("vllm_colocate.app")
 TRAINER_SCRIPT = Path(__file__).with_name("lora_trainer.py")
 SUPERVISOR_ENV_PREFIX = "VLLM_COLOCATE_"
 TRAIN_KINDS = ("sft", "dpo", "kto")
+# vLLM's LoRAConfig only accepts these --max-lora-rank values.
+VLLM_ALLOWED_MAX_LORA_RANKS = (8, 16, 32, 64, 128, 256, 320, 512)
 JOB_OPTION_FIELDS: dict[str, type] = {
     "max_steps": int,
     "train_epochs": float,
@@ -91,6 +93,22 @@ def _env_optional_int(name: str, default: int | None) -> int | None:
     if raw.strip() == "":
         return None
     return int(raw)
+
+
+def _round_up_max_lora_rank(rank: int) -> int:
+    for allowed in VLLM_ALLOWED_MAX_LORA_RANKS:
+        if allowed >= rank:
+            return allowed
+    return VLLM_ALLOWED_MAX_LORA_RANKS[-1]
+
+
+def _default_tensor_parallel_size(gpu_count: int) -> int:
+    """Largest power of two <= gpu_count: attention-head counts are almost
+    always divisible by powers of two, while e.g. TP=3 fails outright."""
+    size = 1
+    while size * 2 <= max(1, gpu_count):
+        size *= 2
+    return size
 
 
 def _safe_slug(value: str) -> str:
@@ -155,6 +173,19 @@ def _partition_gpus() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]
     detected = _detect_gpu_ids()
     inference = _split_csv(os.getenv("VLLM_COLOCATE_INFERENCE_GPUS"))
     training = _split_csv(os.getenv("VLLM_COLOCATE_TRAINING_GPUS"))
+    if detected:
+        for name, override in (
+            ("VLLM_COLOCATE_INFERENCE_GPUS", inference),
+            ("VLLM_COLOCATE_TRAINING_GPUS", training),
+        ):
+            unknown = [gpu for gpu in override if gpu not in detected]
+            if unknown:
+                raise RuntimeError(
+                    f"{name} entries {unknown!r} are not among the detected GPU "
+                    f"ids {list(detected)!r}; use the same identifiers (indices "
+                    "from nvidia-smi, or the tokens in this process's "
+                    "CUDA_VISIBLE_DEVICES)."
+                )
     if inference and training:
         all_gpus = detected or tuple(dict.fromkeys(inference + training))
         return all_gpus, inference, training
@@ -217,13 +248,17 @@ class Settings:
         served_model_name = _env_str(
             "VLLM_COLOCATE_SERVED_MODEL_NAME", model_name
         )
-        data_dir = Path(_env_str("VLLM_COLOCATE_DATA_DIR", "/data/vllm_colocate"))
+        # Resolve to absolute paths so latest.json entries (written by the
+        # trainer relative to the checkpoint dir) never double-join.
+        data_dir = Path(
+            _env_str("VLLM_COLOCATE_DATA_DIR", "/data/vllm_colocate")
+        ).resolve()
         checkpoint_dir = Path(
             _env_str(
                 "VLLM_COLOCATE_CHECKPOINT_DIR",
                 str(data_dir / "checkpoints" / _safe_slug(model_name)),
             )
-        )
+        ).resolve()
         all_gpus, inference_gpus, training_gpus = _partition_gpus()
         gpus_shared = bool(inference_gpus) and inference_gpus == training_gpus
         lora_r = _env_int("VLLM_COLOCATE_LORA_R", 16)
@@ -241,13 +276,13 @@ class Settings:
             checkpoint_dir=checkpoint_dir,
             jobs_dir=Path(
                 _env_str("VLLM_COLOCATE_JOBS_DIR", str(data_dir / "jobs"))
-            ),
+            ).resolve(),
             metrics_path=Path(
                 _env_str(
                     "VLLM_COLOCATE_METRICS_PATH",
                     str(data_dir / "trainer_metrics.jsonl"),
                 )
-            ),
+            ).resolve(),
             all_gpus=all_gpus,
             inference_gpus=inference_gpus,
             training_gpus=training_gpus,
@@ -257,12 +292,15 @@ class Settings:
             ),
             tensor_parallel_size=_env_int(
                 "VLLM_COLOCATE_TENSOR_PARALLEL_SIZE",
-                max(1, len(inference_gpus)),
+                _default_tensor_parallel_size(len(inference_gpus)),
             ),
             max_model_len=_env_optional_int("VLLM_COLOCATE_MAX_MODEL_LEN", None),
             max_num_seqs=_env_optional_int("VLLM_COLOCATE_MAX_NUM_SEQS", None),
             max_loras=_env_int("VLLM_COLOCATE_MAX_LORAS", 1),
-            max_lora_rank=_env_int("VLLM_COLOCATE_MAX_LORA_RANK", max(16, lora_r)),
+            max_lora_rank=_env_int(
+                "VLLM_COLOCATE_MAX_LORA_RANK",
+                _round_up_max_lora_rank(max(16, lora_r)),
+            ),
             trust_remote_code=_env_bool("VLLM_COLOCATE_TRUST_REMOTE_CODE", True),
             vllm_extra_args=_env_str("VLLM_COLOCATE_VLLM_EXTRA_ARGS", ""),
             ready_timeout_seconds=_env_float(
@@ -492,6 +530,12 @@ class TrainingJob:
 def _validate_sample(kind: str, sample: Any) -> str | None:
     if not isinstance(sample, dict):
         return "sample must be a JSON object"
+    messages = sample.get("messages")
+    if messages is not None and (
+        not isinstance(messages, list)
+        or not all(isinstance(message, dict) for message in messages)
+    ):
+        return "messages must be a list of objects"
     has_prompt = bool(sample.get("prompt")) or bool(sample.get("messages"))
     if kind == "sft":
         if sample.get("messages") or sample.get("text"):
@@ -547,19 +591,52 @@ def _extract_options(payload: Any) -> dict[str, Any]:
             options[key] = caster(value)
         except (TypeError, ValueError):
             errors.append(f"option {key!r} must be {caster.__name__}")
+            continue
+        if (
+            key in ("batch_size", "gradient_accumulation_steps", "max_seq_len")
+            and options[key] < 1
+        ):
+            errors.append(f"option {key!r} must be >= 1")
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors[:5]})
     return options
 
 
+def _write_job_rows(data_path: Path, kind: str, samples: list[Any]) -> None:
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    with data_path.open("w", encoding="utf-8") as handle:
+        for sample in samples:
+            row = {
+                **sample,
+                "task": kind,
+                "id": sample.get("id") or str(uuid.uuid4()),
+                "ts": now,
+            }
+            handle.write(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+
+
+_TAIL_LINE_BUDGET_BYTES = 8192
+
+
 def _tail_jsonl(path: Path, *, limit: int) -> list[dict[str, Any]]:
+    limit = max(1, limit)
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            lines = handle.readlines()
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            budget = min(size, limit * _TAIL_LINE_BUDGET_BYTES)
+            handle.seek(size - budget)
+            chunk = handle.read(budget)
     except OSError:
         return []
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    if budget < size and lines:
+        lines = lines[1:]  # drop the first, likely partial, line
     rows: list[dict[str, Any]] = []
-    for line in lines[-max(1, limit):]:
+    for line in lines[-limit:]:
         line = line.strip()
         if not line:
             continue
@@ -603,20 +680,30 @@ class TrainingManager:
             self.worker_task = asyncio.create_task(self._worker())
 
     async def stop(self) -> None:
+        # Capture the in-flight process/job BEFORE cancelling the worker:
+        # _run_job's finally block clears both while the cancellation unwinds.
+        process = self.current_process
+        job = self.jobs.get(self.current_job_id) if self.current_job_id else None
         if self.worker_task is not None:
             self.worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.worker_task
             self.worker_task = None
-        process = self.current_process
         if process is not None and process.returncode is None:
             process.terminate()
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout=10)
             if process.returncode is None:
                 process.kill()
+        if job is not None and not job.done_event.is_set():
+            job.status = "canceled"
+            job.error = "supervisor shutdown"
+            job.finished_at = time.time()
+            job.done_event.set()
 
-    def submit(self, kind: str, samples: list[Any], options: dict[str, Any]) -> TrainingJob:
+    async def submit(
+        self, kind: str, samples: list[Any], options: dict[str, Any]
+    ) -> TrainingJob:
         errors = []
         for index, sample in enumerate(samples):
             error = _validate_sample(kind, sample)
@@ -627,20 +714,8 @@ class TrainingManager:
         if errors:
             raise HTTPException(status_code=400, detail={"errors": errors})
         job_id = f"{kind}-{uuid.uuid4().hex[:12]}"
-        self.settings.jobs_dir.mkdir(parents=True, exist_ok=True)
         data_path = self.settings.jobs_dir / f"{job_id}.jsonl"
-        now = time.time()
-        with data_path.open("w", encoding="utf-8") as handle:
-            for sample in samples:
-                row = {
-                    **sample,
-                    "task": kind,
-                    "id": sample.get("id") or str(uuid.uuid4()),
-                    "ts": now,
-                }
-                handle.write(
-                    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
-                )
+        await asyncio.to_thread(_write_job_rows, data_path, kind, samples)
         job = TrainingJob(
             id=job_id,
             kind=kind,
@@ -662,6 +737,10 @@ class TrainingManager:
         if job is None:
             raise HTTPException(status_code=404, detail="unknown job id")
         if job.status in {"succeeded", "failed", "canceled"}:
+            return job
+        if job.returncode is not None:
+            # The trainer already exited; the job is only finishing its
+            # adapter sync. Too late to cancel.
             return job
         job.cancel_requested = True
         if job.status == "queued":
@@ -759,6 +838,11 @@ class TrainingManager:
                     "trainer reported a missing training dependency "
                     "(see trainer logs)"
                 )
+            elif job.returncode == 3:
+                job.error = (
+                    "trainer built no trainable examples from the submitted "
+                    "samples (see trainer logs)"
+                )
             else:
                 job.error = f"trainer exited with code {job.returncode}"
         job.finished_at = time.time()
@@ -835,13 +919,6 @@ class TrainingManager:
 
     async def sync_adapter(self) -> dict[str, Any]:
         async with self.sync_lock:
-            latest = self.latest_checkpoint()
-            adapter_path = self.resolve_adapter_path()
-            if adapter_path is None:
-                return {
-                    "ok": False,
-                    "error": "no exported adapter found in latest.json",
-                }
             adapter_name = self.settings.adapter_name
             # Bounded wait: if vLLM is still loading, the supervisor loop
             # re-syncs the adapter as soon as it becomes ready.
@@ -849,6 +926,15 @@ class TrainingManager:
                 await self.vllm.wait_ready(timeout_seconds=300.0)
             except (RuntimeError, TimeoutError) as exc:
                 return {"ok": False, "error": f"vLLM not ready: {exc}"}
+            # Resolve AFTER the wait so a checkpoint pruned or replaced in the
+            # meantime cannot leave us loading a stale path.
+            latest = self.latest_checkpoint()
+            adapter_path = self.resolve_adapter_path()
+            if adapter_path is None:
+                return {
+                    "ok": False,
+                    "error": "no exported adapter found in latest.json",
+                }
             ok, error = await self.vllm.load_lora_adapter(
                 adapter_name=adapter_name, adapter_path=adapter_path
             )
@@ -862,6 +948,29 @@ class TrainingManager:
             if not ok:
                 result["error"] = error
                 logger.warning("Adapter sync failed: %s", error)
+                # The stable adapter name was already unloaded; roll back to
+                # the last known-good adapter so inference keeps serving
+                # tuned weights.
+                previous = self.active_adapter()
+                previous_path = previous.get("adapter_path")
+                if (
+                    previous_path
+                    and previous_path != str(adapter_path)
+                    and Path(previous_path).is_dir()
+                ):
+                    rolled_back, rollback_error = await self.vllm.load_lora_adapter(
+                        adapter_name=adapter_name,
+                        adapter_path=Path(previous_path),
+                    )
+                    result["rolled_back"] = rolled_back
+                    if rollback_error:
+                        result["rollback_error"] = rollback_error
+                    logger.warning(
+                        "Rolled back adapter %s to %s: %s",
+                        adapter_name,
+                        previous_path,
+                        rolled_back,
+                    )
                 return result
             try:
                 self.active_adapter_path.parent.mkdir(parents=True, exist_ok=True)
@@ -924,13 +1033,24 @@ async def _supervise_vllm() -> None:
                     backoff,
                 )
                 await asyncio.sleep(backoff)
+                backoff = min(300.0, backoff * 2)
             try:
                 vllm.start()
-                await vllm.wait_ready()
             except Exception:
-                logger.exception("vLLM failed to become ready")
+                logger.exception("Could not start vLLM")
                 await asyncio.sleep(backoff)
                 backoff = min(300.0, backoff * 2)
+                continue
+        if not vllm.ready:
+            try:
+                await vllm.wait_ready()
+            except RuntimeError:
+                # Process exited while waiting; the restart branch above
+                # applies the backoff on the next iteration.
+                logger.exception("vLLM exited before becoming ready")
+                continue
+            except TimeoutError:
+                logger.warning("vLLM still not ready; continuing to wait")
                 continue
             backoff = 5.0
             if settings.sync_on_startup and manager.resolve_adapter_path() is not None:
@@ -990,11 +1110,14 @@ async def _submit_training(
     if not samples:
         raise HTTPException(status_code=400, detail="no training samples provided")
     options = _extract_options(payload)
-    job = manager.submit(kind, samples, options)
+    job = await manager.submit(kind, samples, options)
     if wait:
-        timeout = wait_timeout_seconds if wait_timeout_seconds else None
+        # asyncio.wait_for already treats None as unbounded and 0 as an
+        # immediate done-check.
         with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(job.done_event.wait(), timeout=timeout)
+            await asyncio.wait_for(
+                job.done_event.wait(), timeout=wait_timeout_seconds
+            )
     return job.payload()
 
 
@@ -1002,7 +1125,7 @@ async def _submit_training(
 async def train_sft(
     payload: Any = Body(...),
     wait: bool = Query(default=False),
-    wait_timeout_seconds: float | None = Query(default=None),
+    wait_timeout_seconds: float | None = Query(default=None, ge=0),
 ) -> dict[str, Any]:
     return await _submit_training("sft", payload, wait, wait_timeout_seconds)
 
@@ -1011,7 +1134,7 @@ async def train_sft(
 async def train_dpo(
     payload: Any = Body(...),
     wait: bool = Query(default=False),
-    wait_timeout_seconds: float | None = Query(default=None),
+    wait_timeout_seconds: float | None = Query(default=None, ge=0),
 ) -> dict[str, Any]:
     return await _submit_training("dpo", payload, wait, wait_timeout_seconds)
 
@@ -1020,7 +1143,7 @@ async def train_dpo(
 async def train_kto(
     payload: Any = Body(...),
     wait: bool = Query(default=False),
-    wait_timeout_seconds: float | None = Query(default=None),
+    wait_timeout_seconds: float | None = Query(default=None, ge=0),
 ) -> dict[str, Any]:
     return await _submit_training("kto", payload, wait, wait_timeout_seconds)
 
@@ -1046,9 +1169,10 @@ async def train_job_cancel(job_id: str) -> dict[str, Any]:
 
 @app.get("/train/metrics")
 async def train_metrics(limit: int = Query(default=50, ge=1, le=1000)) -> dict[str, Any]:
+    rows = await asyncio.to_thread(_tail_jsonl, settings.metrics_path, limit=limit)
     return {
         "metrics_path": str(settings.metrics_path),
-        "rows": _tail_jsonl(settings.metrics_path, limit=limit),
+        "rows": rows,
     }
 
 

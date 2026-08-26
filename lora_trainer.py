@@ -170,9 +170,9 @@ def run_training(config: LoraTrainerConfig) -> int:
     dpo_rows = rows_by_task["dpo"]
     kto_rows = rows_by_task["kto"]
     if not sft_rows and not dpo_rows and not kto_rows:
-        logger.info("LoRA trainer found no SFT/DPO/KTO rows at %s", config.data_path)
+        logger.error("LoRA trainer found no SFT/DPO/KTO rows at %s", config.data_path)
         _write_metric(config, {"event": "not_enough_examples", "examples": 0})
-        return 0
+        return 3
 
     logger.info(
         "LoRA trainer starting run_id=%s model=%s data_path=%s checkpoint_dir=%s sft_rows=%d dpo_rows=%d kto_rows=%d parallel_mode=%s rank=%d local_rank=%d",
@@ -245,9 +245,9 @@ def run_training(config: LoraTrainerConfig) -> int:
     ]
     kto_examples = _build_kto_examples(tokenizer, kto_rows, config.max_seq_len)
     if not sft_examples and not dpo_examples and not kto_examples:
-        logger.info("LoRA trainer could not tokenize any SFT/DPO/KTO examples")
+        logger.error("LoRA trainer could not tokenize any SFT/DPO/KTO examples")
         _write_metric(config, {"event": "not_enough_tokenized_examples", "examples": 0})
-        return 0
+        return 3
 
     try:
         model_kwargs = _model_load_kwargs(config)
@@ -331,9 +331,18 @@ def run_training(config: LoraTrainerConfig) -> int:
     )
     step = _restore_latest(config, model, optimizer if config.save_optimizer_state else None)
 
-    first_device = _first_parameter_device(model, config.device, torch)
     if "device_map" not in model_kwargs:
-        model.to(first_device)
+        if str(config.device).startswith("cuda") and torch.cuda.is_available():
+            model.to(torch.device("cuda", int(os.getenv("LOCAL_RANK", "0") or 0)))
+        else:
+            model.to(
+                torch.device(
+                    "cpu"
+                    if str(config.device).startswith("cuda")
+                    else config.device
+                )
+            )
+    first_device = _first_parameter_device(model, config.device, torch)
     model.train()
 
     planned_steps = _planned_steps(
@@ -375,50 +384,56 @@ def run_training(config: LoraTrainerConfig) -> int:
             logger.info("LoRA trainer stopping at local_step=%d", local_step)
             break
         task = _task_for_step(local_step, available_tasks)
+        # Decouple the example-selection counter from the task stride so a
+        # task visited every len(available_tasks) steps still walks through
+        # its whole dataset instead of aliasing onto a subset.
+        task_step = (step + local_step) // len(available_tasks)
         loss_value = 0.0
         for accum_index in range(accum):
             if task == "dpo":
                 batch = _dpo_batch_for_step(
                     dpo_examples,
-                    step + local_step,
+                    task_step,
                     accum_index,
                     config.batch_size,
                     tokenizer.pad_token_id,
                     torch,
                     first_device,
                 )
-                loss = _dpo_loss(
-                    model,
-                    batch,
-                    beta=config.dpo_beta,
-                    loss_vocab_sample_size=config.loss_vocab_sample_size,
-                    torch=torch,
-                    F=F,
-                )
+                with _dropout_disabled(model):
+                    loss = _dpo_loss(
+                        model,
+                        batch,
+                        beta=config.dpo_beta,
+                        loss_vocab_sample_size=config.loss_vocab_sample_size,
+                        torch=torch,
+                        F=F,
+                    )
             elif task == "kto":
                 batch = _kto_batch_for_step(
                     kto_examples,
-                    step + local_step,
+                    task_step,
                     accum_index,
                     config.batch_size,
                     tokenizer.pad_token_id,
                     torch,
                     first_device,
                 )
-                loss = _kto_loss(
-                    model,
-                    batch,
-                    beta=config.kto_beta,
-                    desirable_weight=config.kto_desirable_weight,
-                    undesirable_weight=config.kto_undesirable_weight,
-                    loss_vocab_sample_size=config.loss_vocab_sample_size,
-                    torch=torch,
-                    F=F,
-                )
+                with _dropout_disabled(model):
+                    loss = _kto_loss(
+                        model,
+                        batch,
+                        beta=config.kto_beta,
+                        desirable_weight=config.kto_desirable_weight,
+                        undesirable_weight=config.kto_undesirable_weight,
+                        loss_vocab_sample_size=config.loss_vocab_sample_size,
+                        torch=torch,
+                        F=F,
+                    )
             else:
                 batch = _sft_batch_for_step(
                     sft_examples,
-                    step + local_step,
+                    task_step,
                     accum_index,
                     config.batch_size,
                     tokenizer.pad_token_id,
@@ -545,33 +560,49 @@ def _configure_tokenizer(tokenizer: Any) -> None:
 def _build_sft_example(
     tokenizer: Any, row: dict[str, Any], max_seq_len: int
 ) -> dict[str, list[int]] | None:
-    prompt_text = ""
-    full_text = ""
     messages = row.get("messages")
     if isinstance(messages, list) and messages:
         prompt_messages, full_messages = _split_prompt_completion_messages(messages)
         prompt_text = _render_messages(tokenizer, prompt_messages, add_generation_prompt=True)
         full_text = _render_messages(tokenizer, full_messages, add_generation_prompt=False)
-    elif row.get("prompt") is not None and row.get("completion") is not None:
+        if prompt_text and full_text.startswith(prompt_text):
+            return _sequence_with_prompt_mask(
+                tokenizer, prompt_text, full_text[len(prompt_text):], max_seq_len
+            )
+        if not full_text:
+            return None
+        full_ids = _tokenize_text(tokenizer, full_text, max_seq_len=max_seq_len)
+        if not full_ids:
+            return None
+        prompt_len = 0
+        if prompt_text:
+            prompt_len = len(
+                _tokenize_text(tokenizer, prompt_text, max_seq_len=max_seq_len)
+            )
+            prompt_len = min(prompt_len, max(0, len(full_ids) - 1))
+        labels = list(full_ids)
+        for index in range(prompt_len):
+            labels[index] = -100
+        if not any(label != -100 for label in labels):
+            return None
+        return {"input_ids": full_ids, "labels": labels}
+    if row.get("prompt") is not None and row.get("completion") is not None:
         prompt_text = str(row.get("prompt") or "")
-        full_text = prompt_text + str(row.get("completion") or "")
-    elif row.get("text") is not None:
+        completion_text = _completion_text(tokenizer, row.get("completion"))
+        if not completion_text:
+            return None
+        return _sequence_with_prompt_mask(
+            tokenizer, prompt_text, completion_text, max_seq_len
+        )
+    if row.get("text") is not None:
         full_text = str(row.get("text") or "")
-    if not full_text:
-        return None
-    full_ids = _tokenize_text(tokenizer, full_text, max_seq_len=max_seq_len)
-    if not full_ids:
-        return None
-    prompt_len = 0
-    if prompt_text:
-        prompt_len = len(_tokenize_text(tokenizer, prompt_text, max_seq_len=max_seq_len))
-        prompt_len = min(prompt_len, max(0, len(full_ids) - 1))
-    labels = list(full_ids)
-    for index in range(prompt_len):
-        labels[index] = -100
-    if not any(label != -100 for label in labels):
-        return None
-    return {"input_ids": full_ids, "labels": labels}
+        if not full_text:
+            return None
+        full_ids = _tokenize_text(tokenizer, full_text, max_seq_len=max_seq_len)
+        if not full_ids:
+            return None
+        return {"input_ids": full_ids, "labels": list(full_ids)}
+    return None
 
 
 def _build_dpo_example(
@@ -650,6 +681,7 @@ def _render_messages(
         return "\n".join(
             f"{message.get('role', 'user')}: {message.get('content', '')}"
             for message in messages
+            if isinstance(message, dict)
         )
 
 
@@ -657,14 +689,15 @@ def _split_prompt_completion_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     for index in range(len(messages) - 1, -1, -1):
-        if str(messages[index].get("role") or "") == "assistant":
+        entry = messages[index]
+        if isinstance(entry, dict) and str(entry.get("role") or "") == "assistant":
             return messages[:index], messages[: index + 1]
     return [], messages
 
 
 def _prompt_text(tokenizer: Any, row: dict[str, Any]) -> str:
     prompt = row.get("prompt")
-    if prompt is not None:
+    if prompt:
         return str(prompt)
     messages = row.get("messages")
     if isinstance(messages, list) and messages:
@@ -693,19 +726,31 @@ def _tokenize_text(tokenizer: Any, text: str, *, max_seq_len: int) -> list[int]:
 def _sequence_with_prompt_mask(
     tokenizer: Any, prompt_text: str, completion_text: str, max_seq_len: int
 ) -> dict[str, list[int]] | None:
-    prompt_ids = _tokenize_text(tokenizer, prompt_text, max_seq_len=max_seq_len)
-    full_ids = _tokenize_text(
-        tokenizer, prompt_text + completion_text, max_seq_len=max_seq_len
-    )
-    if not full_ids:
+    # Tokenize prompt and completion separately so the mask boundary is exact
+    # (no BPE merge across it), and truncate the prompt from the left so the
+    # supervised completion tokens are always preserved.
+    completion_ids = [
+        int(token_id)
+        for token_id in tokenizer(completion_text, add_special_tokens=False).get(
+            "input_ids", []
+        )
+    ][:max_seq_len]
+    if not completion_ids:
         return None
-    prompt_len = min(len(prompt_ids), max(0, len(full_ids) - 1))
-    labels = list(full_ids)
-    for index in range(prompt_len):
-        labels[index] = -100
-    if not any(label != -100 for label in labels):
-        return None
-    return {"input_ids": full_ids, "labels": labels}
+    prompt_ids: list[int] = []
+    if prompt_text:
+        prompt_ids = [
+            int(token_id)
+            for token_id in tokenizer(prompt_text, add_special_tokens=False).get(
+                "input_ids", []
+            )
+        ]
+        budget = max_seq_len - len(completion_ids)
+        prompt_ids = prompt_ids[-budget:] if budget > 0 else []
+    return {
+        "input_ids": prompt_ids + completion_ids,
+        "labels": [-100] * len(prompt_ids) + completion_ids,
+    }
 
 
 def _model_load_kwargs(config: LoraTrainerConfig) -> dict[str, Any]:
@@ -1622,7 +1667,7 @@ def _training_quantization_config(config: LoraTrainerConfig) -> Any | None:
             backward_dtype="mxfp4",
             store_master_weights=True,
         )
-    raise ValueError(f"Unsupported live LoRA quantization mode: {config.quantization}")
+    raise ValueError(f"Unsupported LoRA training quantization mode: {config.quantization}")
 
 
 def _fouroversix_runtime_available() -> bool:
@@ -1778,6 +1823,25 @@ def _parent_module(model: Any, module_name: str) -> tuple[Any, str]:
 
 
 @contextlib.contextmanager
+def _dropout_disabled(model: Any):
+    """Preference losses (DPO/KTO) compare policy and reference passes;
+    dropout noise on only the policy side would bias the log-ratios."""
+    import torch
+
+    dropouts = [
+        module for module in model.modules() if isinstance(module, torch.nn.Dropout)
+    ]
+    previous = [module.training for module in dropouts]
+    try:
+        for module in dropouts:
+            module.eval()
+        yield
+    finally:
+        for module, was_training in zip(dropouts, previous):
+            module.train(was_training)
+
+
+@contextlib.contextmanager
 def _lora_disabled(model: Any):
     wrappers = [module for module in model.modules() if hasattr(module, "lora_A") and hasattr(module, "enabled")]
     previous = [bool(module.enabled) for module in wrappers]
@@ -1803,7 +1867,10 @@ def _first_parameter_device(model: Any, requested_device: str, torch: Any) -> An
 def _planned_steps(config: LoraTrainerConfig, example_count: int) -> int:
     if config.max_steps > 0:
         return config.max_steps
-    batches = max(1, math.ceil(max(1, example_count) / max(1, config.batch_size)))
+    examples_per_step = max(1, config.batch_size) * max(
+        1, config.gradient_accumulation_steps
+    )
+    batches = max(1, math.ceil(max(1, example_count) / examples_per_step))
     return max(1, math.ceil(batches * max(0.0, config.train_epochs)))
 
 
@@ -1877,6 +1944,7 @@ def _select_examples(
 ) -> list[Any]:
     if not examples:
         raise ValueError("No examples available")
+    batch_size = max(1, batch_size)
     start = ((step * 9973) + accum_index * batch_size) % len(examples)
     selected = [examples[(start + offset) % len(examples)] for offset in range(batch_size)]
     if len(examples) > batch_size:
@@ -1949,6 +2017,7 @@ def _dpo_loss(
         model,
         chosen,
         loss_vocab_sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -1956,6 +2025,7 @@ def _dpo_loss(
         model,
         rejected,
         loss_vocab_sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -1964,6 +2034,7 @@ def _dpo_loss(
             model,
             chosen,
             loss_vocab_sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -1971,6 +2042,7 @@ def _dpo_loss(
             model,
             rejected,
             loss_vocab_sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -1998,6 +2070,7 @@ def _dpo_loss_with_shared_hidden(
         chosen,
         chosen_hidden,
         sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -2006,6 +2079,7 @@ def _dpo_loss_with_shared_hidden(
         rejected,
         rejected_hidden,
         sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -2017,6 +2091,7 @@ def _dpo_loss_with_shared_hidden(
             chosen,
             chosen_hidden.detach(),
             sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -2025,6 +2100,7 @@ def _dpo_loss_with_shared_hidden(
             rejected,
             rejected_hidden.detach(),
             sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -2055,6 +2131,7 @@ def _kto_loss(
         model,
         target,
         loss_vocab_sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -2063,6 +2140,7 @@ def _kto_loss(
             model,
             target,
             loss_vocab_sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -2073,6 +2151,7 @@ def _kto_loss(
                 model,
                 kl_batch,
                 loss_vocab_sample_size=loss_vocab_sample_size,
+                average=False,
                 torch=torch,
                 F=F,
             )
@@ -2081,6 +2160,7 @@ def _kto_loss(
                     model,
                     kl_batch,
                     loss_vocab_sample_size=loss_vocab_sample_size,
+                    average=False,
                     torch=torch,
                     F=F,
                 )
@@ -2104,6 +2184,7 @@ def _sequence_logprob(
     batch: dict[str, Any],
     *,
     loss_vocab_sample_size: int = 0,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any:
@@ -2111,6 +2192,7 @@ def _sequence_logprob(
         model,
         batch,
         loss_vocab_sample_size=loss_vocab_sample_size,
+        average=average,
         torch=torch,
         F=F,
     )
@@ -2121,6 +2203,7 @@ def _sequence_nll(
     batch: dict[str, Any],
     *,
     loss_vocab_sample_size: int = 0,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any:
@@ -2129,6 +2212,7 @@ def _sequence_nll(
             model,
             batch,
             sample_size=loss_vocab_sample_size,
+            average=average,
             torch=torch,
             F=F,
         )
@@ -2139,7 +2223,9 @@ def _sequence_nll(
         attention_mask=batch["attention_mask"],
         use_cache=False,
     )
-    return _completion_nll(outputs.logits, batch["labels"], torch=torch, F=F)
+    return _completion_nll(
+        outputs.logits, batch["labels"], average=average, torch=torch, F=F
+    )
 
 
 def _sampled_completion_nll(
@@ -2147,6 +2233,7 @@ def _sampled_completion_nll(
     batch: dict[str, Any],
     *,
     sample_size: int,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any | None:
@@ -2156,6 +2243,7 @@ def _sampled_completion_nll(
         batch,
         hidden,
         sample_size=sample_size,
+        average=average,
         torch=torch,
         F=F,
     )
@@ -2167,6 +2255,7 @@ def _sampled_completion_nll_from_hidden(
     hidden: Any,
     *,
     sample_size: int,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any | None:
@@ -2203,6 +2292,8 @@ def _sampled_completion_nll_from_hidden(
     ).squeeze(-1)
     token_nll = valid_logits.new_zeros(mask.shape)
     token_nll[mask] = token_nll_values
+    if not average:
+        return token_nll.sum(dim=1)
     denom = mask.sum(dim=1).clamp_min(1).to(token_nll.dtype)
     return token_nll.sum(dim=1) / denom
 
@@ -2426,7 +2517,9 @@ def _selected_linear_logits(
     return output.reshape(*input.shape[:-1], output.shape[-1])
 
 
-def _completion_nll(logits: Any, labels: Any, *, torch: Any, F: Any) -> Any:
+def _completion_nll(
+    logits: Any, labels: Any, *, average: bool = True, torch: Any, F: Any
+) -> Any:
     labels = labels.to(logits.device)
     shift_logits = logits[:, :-1, :].float()
     shift_labels = labels[:, 1:]
@@ -2435,6 +2528,8 @@ def _completion_nll(logits: Any, labels: Any, *, torch: Any, F: Any) -> Any:
     log_probs = F.log_softmax(shift_logits, dim=-1)
     token_log_probs = log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
     token_nll = -token_log_probs * mask.to(token_log_probs.dtype)
+    if not average:
+        return token_nll.sum(dim=1)
     return token_nll.sum(dim=1) / mask.sum(dim=1).clamp_min(1).to(token_nll.dtype)
 
 
@@ -2453,7 +2548,7 @@ def _restore_latest(
 
         payload = torch.load(checkpoint_path, map_location="cpu")
     except Exception:
-        logger.exception("Failed to restore live LoRA checkpoint %s", checkpoint_path)
+        logger.exception("Failed to restore LoRA checkpoint %s", checkpoint_path)
         return 0
     state = payload.get("lora_state")
     if isinstance(state, dict):
@@ -2462,7 +2557,7 @@ def _restore_latest(
         try:
             optimizer.load_state_dict(payload["optimizer"])
         except Exception:
-            logger.warning("Could not restore live LoRA optimizer state", exc_info=True)
+            logger.warning("Could not restore LoRA optimizer state", exc_info=True)
     try:
         return int(payload.get("step") or latest.get("step") or 0)
     except (TypeError, ValueError):
@@ -2577,6 +2672,10 @@ def _export_peft_adapter(
 ) -> None:
     from safetensors.torch import save_file
 
+    if adapter_dir.exists():
+        # Same-step re-export: the weights are identical, and replacing the
+        # dir in place would race a concurrent vLLM adapter load.
+        return
     tmp_dir = adapter_dir.with_name(adapter_dir.name + ".tmp")
     if tmp_dir.exists():
         _remove_tree(tmp_dir)
@@ -2605,8 +2704,6 @@ def _export_peft_adapter(
         + "\n",
         encoding="utf-8",
     )
-    if adapter_dir.exists():
-        _remove_tree(adapter_dir)
     tmp_dir.replace(adapter_dir)
 
 
@@ -2659,6 +2756,11 @@ def _prune_checkpoints(config: LoraTrainerConfig) -> None:
     latest_adapter = _resolved(latest.get("adapter_path"))
     if latest_adapter is not None:
         keep_adapters.add(latest_adapter)
+    # Never delete the adapter the supervisor has loaded into vLLM.
+    active = _read_json_file(config.checkpoint_dir / "active_adapter.json")
+    active_adapter = _resolved(active.get("adapter_path"))
+    if active_adapter is not None:
+        keep_adapters.add(active_adapter)
     for adapter_dir in adapter_dirs:
         if adapter_dir not in keep_adapters:
             try:
@@ -2698,7 +2800,7 @@ def _write_metric(config: LoraTrainerConfig, payload: dict[str, Any]) -> None:
         with config.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
     except OSError:
-        logger.exception("Failed to write live LoRA metric to %s", config.metrics_path)
+        logger.exception("Failed to write LoRA trainer metric to %s", config.metrics_path)
 
 
 def _configure_logging() -> None:
@@ -3038,7 +3140,7 @@ def main() -> int:
         LoraTrainerConfig(
             model_name=args.model_name,
             data_path=Path(args.data_path),
-            checkpoint_dir=Path(args.checkpoint_dir),
+            checkpoint_dir=Path(args.checkpoint_dir).resolve(),
             adapter_name=args.adapter_name,
             task_mix=args.task_mix,
             device=args.device,
