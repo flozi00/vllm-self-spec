@@ -16,7 +16,7 @@ from typing import Any, Iterable
 
 
 _TERMINATION_REQUESTED = False
-logger = logging.getLogger("vllm_dflash_jit.live_lora_trainer")
+logger = logging.getLogger("vllm_colocate.lora_trainer")
 
 
 def _handle_termination_signal(_signum: int, _frame: Any | None) -> None:
@@ -33,7 +33,7 @@ def _install_signal_handlers() -> None:
 
 
 @dataclass(frozen=True)
-class LiveLoraTrainerConfig:
+class LoraTrainerConfig:
     model_name: str
     data_path: Path
     checkpoint_dir: Path
@@ -50,6 +50,9 @@ class LiveLoraTrainerConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     dpo_beta: float = 0.1
+    kto_beta: float = 0.1
+    kto_desirable_weight: float = 1.0
+    kto_undesirable_weight: float = 1.0
     loss_vocab_sample_size: int = 0
     lora_r: int = 16
     lora_alpha: float = 32.0
@@ -76,22 +79,18 @@ class LiveLoraTrainerConfig:
     log_every: int = 1
 
 
-class LoRALinear:
-    pass
-
-
 class MissingTrainingDependency(RuntimeError):
     pass
 
 
-_MODELOPT_NVFP4_STATE_ATTR = "_vllm_dflash_modelopt_nvfp4_state"
+_MODELOPT_NVFP4_STATE_ATTR = "_vllm_colocate_modelopt_nvfp4_state"
 _FOUROVERSIX_DEQUANTIZED_WEIGHT_CACHE_ATTR = (
-    "_vllm_dflash_fouroversix_dequantized_weight_cache"
+    "_vllm_colocate_fouroversix_dequantized_weight_cache"
 )
 _FOUROVERSIX_FORCE_DEQUANTIZED_FORWARD_ATTR = (
-    "_vllm_dflash_fouroversix_force_dequantized_forward"
+    "_vllm_colocate_fouroversix_force_dequantized_forward"
 )
-_MODELOPT_NVFP4_MODULE_NAME_ATTR = "_vllm_dflash_modelopt_nvfp4_module_name"
+_MODELOPT_NVFP4_MODULE_NAME_ATTR = "_vllm_colocate_modelopt_nvfp4_module_name"
 _FOUROVERSIX_DEQUANTIZED_CACHE_BYTES = 0
 _MODELOPT_NVFP4_CPU_CACHE_BYTES = 0
 
@@ -143,12 +142,13 @@ class _SafetensorsKeyStore:
             return handle.get_tensor(key)
 
 
-def run_training(config: LiveLoraTrainerConfig) -> int:
+def run_training(config: LoraTrainerConfig) -> int:
     import torch
     import torch.nn.functional as F
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     _configure_logging()
+    _configure_torch_matmul_precision(torch)
     _install_transformers_remote_code_compat()
     _install_signal_handlers()
     run_started = time.time()
@@ -157,25 +157,32 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
     primary = rank == 0
 
     rows = _load_training_rows(config.data_path)
-    sft_rows = [row for row in rows if row.get("task") == "sft"]
-    dpo_rows = [row for row in rows if row.get("task") == "dpo"]
-    if config.task_mix == "sft":
-        dpo_rows = []
-    elif config.task_mix == "dpo":
-        sft_rows = []
-    if not sft_rows and not dpo_rows:
-        logger.info("Live LoRA trainer found no SFT/DPO rows at %s", config.data_path)
+    rows_by_task = {
+        task: [row for row in rows if row.get("task") == task]
+        for task in ("sft", "dpo", "kto")
+    }
+    if config.task_mix in rows_by_task:
+        rows_by_task = {
+            task: (task_rows if task == config.task_mix else [])
+            for task, task_rows in rows_by_task.items()
+        }
+    sft_rows = rows_by_task["sft"]
+    dpo_rows = rows_by_task["dpo"]
+    kto_rows = rows_by_task["kto"]
+    if not sft_rows and not dpo_rows and not kto_rows:
+        logger.error("LoRA trainer found no SFT/DPO/KTO rows at %s", config.data_path)
         _write_metric(config, {"event": "not_enough_examples", "examples": 0})
-        return 0
+        return 3
 
     logger.info(
-        "Live LoRA trainer starting run_id=%s model=%s data_path=%s checkpoint_dir=%s sft_rows=%d dpo_rows=%d parallel_mode=%s rank=%d local_rank=%d",
+        "LoRA trainer starting run_id=%s model=%s data_path=%s checkpoint_dir=%s sft_rows=%d dpo_rows=%d kto_rows=%d parallel_mode=%s rank=%d local_rank=%d",
         config.run_id or "-",
         config.model_name,
         config.data_path,
         config.checkpoint_dir,
         len(sft_rows),
         len(dpo_rows),
+        len(kto_rows),
         config.parallel_mode,
         rank,
         local_rank,
@@ -184,13 +191,14 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
         config,
         {
             "event": "run_start",
-            "trainer": "live_lora",
+            "trainer": "lora",
             "model_name": config.model_name,
             "data_path": str(config.data_path),
             "checkpoint_dir": str(config.checkpoint_dir),
             "adapter_name": config.adapter_name,
             "sft_rows": len(sft_rows),
             "dpo_rows": len(dpo_rows),
+            "kto_rows": len(kto_rows),
             "task_mix": config.task_mix,
             "parallel_mode": config.parallel_mode,
             "rank": rank,
@@ -202,6 +210,9 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
             "max_seq_len": config.max_seq_len,
             "learning_rate": config.learning_rate,
             "dpo_beta": config.dpo_beta,
+            "kto_beta": config.kto_beta,
+            "kto_desirable_weight": config.kto_desirable_weight,
+            "kto_undesirable_weight": config.kto_undesirable_weight,
             "loss_vocab_sample_size": config.loss_vocab_sample_size,
             "lora_r": config.lora_r,
             "lora_alpha": config.lora_alpha,
@@ -213,7 +224,7 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
         },
     )
     if _stop_requested(config.stop_file):
-        _write_metric(config, {"event": "stopped_before_start", "trainer": "live_lora"})
+        _write_metric(config, {"event": "stopped_before_start", "trainer": "lora"})
         return 0
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -232,39 +243,40 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
         for example in [_build_dpo_example(tokenizer, row, config.max_seq_len)]
         if example is not None
     ]
-    if not sft_examples and not dpo_examples:
-        logger.info("Live LoRA trainer could not tokenize any SFT/DPO examples")
+    kto_examples = _build_kto_examples(tokenizer, kto_rows, config.max_seq_len)
+    if not sft_examples and not dpo_examples and not kto_examples:
+        logger.error("LoRA trainer could not tokenize any SFT/DPO/KTO examples")
         _write_metric(config, {"event": "not_enough_tokenized_examples", "examples": 0})
-        return 0
+        return 3
 
     try:
         model_kwargs = _model_load_kwargs(config)
     except MissingTrainingDependency as exc:
         message = str(exc)
-        logger.error("Live LoRA trainer dependency check failed: %s", message)
+        logger.error("LoRA trainer dependency check failed: %s", message)
         _write_metric(
             config,
             {
                 "event": "missing_training_dependency",
-                "trainer": "live_lora",
+                "trainer": "lora",
                 "error": message,
                 "quantization": config.quantization,
             },
         )
         return 2
-    logger.info("Live LoRA trainer loading base model with kwargs=%s", model_kwargs)
+    logger.info("LoRA trainer loading base model with kwargs=%s", model_kwargs)
     try:
         model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     except Exception as exc:
         if not _is_missing_training_dependency_exception(exc):
             raise
         message = str(exc)
-        logger.error("Live LoRA trainer model load dependency failed: %s", message)
+        logger.error("LoRA trainer model load dependency failed: %s", message)
         _write_metric(
             config,
             {
                 "event": "missing_training_dependency",
-                "trainer": "live_lora",
+                "trainer": "lora",
                 "error": message,
                 "quantization": config.quantization,
             },
@@ -275,14 +287,14 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
     )
     if modelopt_nvfp4_modules:
         logger.info(
-            "Live LoRA trainer attached ModelOpt NVFP4 sidecar tensors to %d modules",
+            "LoRA trainer attached ModelOpt NVFP4 sidecar tensors to %d modules",
             modelopt_nvfp4_modules,
         )
     if hasattr(model, "config"):
         model.config.use_cache = False
 
     logger.info(
-        "Live LoRA trainer injecting modules targets=%s include_expert_lora=%s",
+        "LoRA trainer injecting modules targets=%s include_expert_lora=%s",
         ",".join(config.lora_target_modules),
         config.include_expert_lora,
     )
@@ -294,10 +306,10 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
         alpha=config.lora_alpha,
         dropout=config.lora_dropout,
     )
-    logger.info("Live LoRA trainer injected %d LoRA modules", len(wrappers))
+    logger.info("LoRA trainer injected %d LoRA modules", len(wrappers))
     if not wrappers:
         raise RuntimeError(
-            "No LoRA target modules were found. Set VLLM_JETSPEC_LIVE_LORA_TARGET_MODULES "
+            "No LoRA target modules were found. Set VLLM_COLOCATE_LORA_TARGET_MODULES "
             "for this model architecture."
         )
     if _lora_targets_need_backbone_grad_checkpointing(config.lora_target_modules) and hasattr(
@@ -319,21 +331,42 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
     )
     step = _restore_latest(config, model, optimizer if config.save_optimizer_state else None)
 
-    first_device = _first_parameter_device(model, config.device, torch)
     if "device_map" not in model_kwargs:
-        model.to(first_device)
+        if str(config.device).startswith("cuda") and torch.cuda.is_available():
+            model.to(torch.device("cuda", int(os.getenv("LOCAL_RANK", "0") or 0)))
+        else:
+            model.to(
+                torch.device(
+                    "cpu"
+                    if str(config.device).startswith("cuda")
+                    else config.device
+                )
+            )
+    first_device = _first_parameter_device(model, config.device, torch)
     model.train()
 
-    planned_steps = _planned_steps(config, len(sft_examples), len(dpo_examples))
+    planned_steps = _planned_steps(
+        config, len(sft_examples) + len(dpo_examples) + len(kto_examples)
+    )
+    available_tasks = [
+        task
+        for task, examples in (
+            ("sft", sft_examples),
+            ("dpo", dpo_examples),
+            ("kto", kto_examples),
+        )
+        if examples
+    ]
     if step > 0:
-        logger.info("Live LoRA trainer restored checkpoint at global_step=%d", step)
+        logger.info("LoRA trainer restored checkpoint at global_step=%d", step)
     _write_metric(
         config,
         {
             "event": "ready",
-            "trainer": "live_lora",
+            "trainer": "lora",
             "sft_examples": len(sft_examples),
             "dpo_examples": len(dpo_examples),
+            "kto_examples": len(kto_examples),
             "lora_modules": sorted(wrappers),
             "trainable_parameters": sum(parameter.numel() for parameter in trainable_parameters),
             "restored_step": step,
@@ -348,33 +381,59 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
     optimizer.zero_grad(set_to_none=True)
     for local_step in range(planned_steps):
         if _TERMINATION_REQUESTED or _stop_requested(config.stop_file):
-            logger.info("Live LoRA trainer stopping at local_step=%d", local_step)
+            logger.info("LoRA trainer stopping at local_step=%d", local_step)
             break
-        task = _task_for_step(local_step, bool(sft_examples), bool(dpo_examples))
+        task = _task_for_step(local_step, available_tasks)
+        # Decouple the example-selection counter from the task stride so a
+        # task visited every len(available_tasks) steps still walks through
+        # its whole dataset instead of aliasing onto a subset.
+        task_step = (step + local_step) // len(available_tasks)
         loss_value = 0.0
         for accum_index in range(accum):
             if task == "dpo":
                 batch = _dpo_batch_for_step(
                     dpo_examples,
-                    step + local_step,
+                    task_step,
                     accum_index,
                     config.batch_size,
                     tokenizer.pad_token_id,
                     torch,
                     first_device,
                 )
-                loss = _dpo_loss(
-                    model,
-                    batch,
-                    beta=config.dpo_beta,
-                    loss_vocab_sample_size=config.loss_vocab_sample_size,
-                    torch=torch,
-                    F=F,
+                with _dropout_disabled(model):
+                    loss = _dpo_loss(
+                        model,
+                        batch,
+                        beta=config.dpo_beta,
+                        loss_vocab_sample_size=config.loss_vocab_sample_size,
+                        torch=torch,
+                        F=F,
+                    )
+            elif task == "kto":
+                batch = _kto_batch_for_step(
+                    kto_examples,
+                    task_step,
+                    accum_index,
+                    config.batch_size,
+                    tokenizer.pad_token_id,
+                    torch,
+                    first_device,
                 )
+                with _dropout_disabled(model):
+                    loss = _kto_loss(
+                        model,
+                        batch,
+                        beta=config.kto_beta,
+                        desirable_weight=config.kto_desirable_weight,
+                        undesirable_weight=config.kto_undesirable_weight,
+                        loss_vocab_sample_size=config.loss_vocab_sample_size,
+                        torch=torch,
+                        F=F,
+                    )
             else:
                 batch = _sft_batch_for_step(
                     sft_examples,
-                    step + local_step,
+                    task_step,
                     accum_index,
                     config.batch_size,
                     tokenizer.pad_token_id,
@@ -390,7 +449,7 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
                 )
             if not bool(torch.isfinite(loss.detach()).all().cpu()):
                 raise RuntimeError(
-                    f"Live LoRA trainer produced non-finite {task} loss "
+                    f"LoRA trainer produced non-finite {task} loss "
                     f"at local_step={local_step} accum_index={accum_index}"
                 )
             (loss / accum).backward()
@@ -398,7 +457,7 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
         sanitized_gradients = _sanitize_nonfinite_gradients(trainable_parameters, torch)
         if sanitized_gradients:
             logger.warning(
-                "Live LoRA trainer sanitized %d non-finite gradient tensor(s) "
+                "LoRA trainer sanitized %d non-finite gradient tensor(s) "
                 "at local_step=%d task=%s",
                 sanitized_gradients,
                 local_step,
@@ -410,7 +469,7 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
         sanitized_optimizer_states = _sanitize_nonfinite_optimizer_state(optimizer, torch)
         if sanitized_optimizer_states:
             logger.warning(
-                "Live LoRA trainer sanitized %d non-finite optimizer state tensor(s) "
+                "LoRA trainer sanitized %d non-finite optimizer state tensor(s) "
                 "at local_step=%d task=%s",
                 sanitized_optimizer_states,
                 local_step,
@@ -426,7 +485,7 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
             elapsed = time.time() - run_started
             progress = completed_steps / max(1, planned_steps)
             logger.info(
-                "Live LoRA trainer step %d/%d task=%s loss=%.4f elapsed=%.1fs",
+                "LoRA trainer step %d/%d task=%s loss=%.4f elapsed=%.1fs",
                 completed_steps,
                 planned_steps,
                 task,
@@ -437,7 +496,7 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
                 config,
                 {
                     "event": "step",
-                    "trainer": "live_lora",
+                    "trainer": "lora",
                     "step": global_step,
                     "local_step": completed_steps,
                     "max_steps": planned_steps,
@@ -461,7 +520,7 @@ def run_training(config: LiveLoraTrainerConfig) -> int:
         config,
         {
             "event": "run_complete",
-            "trainer": "live_lora",
+            "trainer": "lora",
             "step": step + completed_steps,
             "completed_steps": completed_steps,
             "max_steps": planned_steps,
@@ -484,7 +543,7 @@ def _load_training_rows(path: Path) -> list[dict[str, Any]]:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(row, dict) and row.get("task") in {"sft", "dpo"}:
+                if isinstance(row, dict) and row.get("task") in {"sft", "dpo", "kto"}:
                     rows.append(row)
     except FileNotFoundError:
         return []
@@ -501,33 +560,49 @@ def _configure_tokenizer(tokenizer: Any) -> None:
 def _build_sft_example(
     tokenizer: Any, row: dict[str, Any], max_seq_len: int
 ) -> dict[str, list[int]] | None:
-    prompt_text = ""
-    full_text = ""
     messages = row.get("messages")
     if isinstance(messages, list) and messages:
         prompt_messages, full_messages = _split_prompt_completion_messages(messages)
         prompt_text = _render_messages(tokenizer, prompt_messages, add_generation_prompt=True)
         full_text = _render_messages(tokenizer, full_messages, add_generation_prompt=False)
-    elif row.get("prompt") is not None and row.get("completion") is not None:
+        if prompt_text and full_text.startswith(prompt_text):
+            return _sequence_with_prompt_mask(
+                tokenizer, prompt_text, full_text[len(prompt_text):], max_seq_len
+            )
+        if not full_text:
+            return None
+        full_ids = _tokenize_text(tokenizer, full_text, max_seq_len=max_seq_len)
+        if not full_ids:
+            return None
+        prompt_len = 0
+        if prompt_text:
+            prompt_len = len(
+                _tokenize_text(tokenizer, prompt_text, max_seq_len=max_seq_len)
+            )
+            prompt_len = min(prompt_len, max(0, len(full_ids) - 1))
+        labels = list(full_ids)
+        for index in range(prompt_len):
+            labels[index] = -100
+        if not any(label != -100 for label in labels):
+            return None
+        return {"input_ids": full_ids, "labels": labels}
+    if row.get("prompt") is not None and row.get("completion") is not None:
         prompt_text = str(row.get("prompt") or "")
-        full_text = prompt_text + str(row.get("completion") or "")
-    elif row.get("text") is not None:
+        completion_text = _completion_text(tokenizer, row.get("completion"))
+        if not completion_text:
+            return None
+        return _sequence_with_prompt_mask(
+            tokenizer, prompt_text, completion_text, max_seq_len
+        )
+    if row.get("text") is not None:
         full_text = str(row.get("text") or "")
-    if not full_text:
-        return None
-    full_ids = _tokenize_text(tokenizer, full_text, max_seq_len=max_seq_len)
-    if not full_ids:
-        return None
-    prompt_len = 0
-    if prompt_text:
-        prompt_len = len(_tokenize_text(tokenizer, prompt_text, max_seq_len=max_seq_len))
-        prompt_len = min(prompt_len, max(0, len(full_ids) - 1))
-    labels = list(full_ids)
-    for index in range(prompt_len):
-        labels[index] = -100
-    if not any(label != -100 for label in labels):
-        return None
-    return {"input_ids": full_ids, "labels": labels}
+        if not full_text:
+            return None
+        full_ids = _tokenize_text(tokenizer, full_text, max_seq_len=max_seq_len)
+        if not full_ids:
+            return None
+        return {"input_ids": full_ids, "labels": list(full_ids)}
+    return None
 
 
 def _build_dpo_example(
@@ -545,6 +620,54 @@ def _build_dpo_example(
     return {"chosen": chosen, "rejected": rejected}
 
 
+def _build_kto_examples(
+    tokenizer: Any, rows: list[dict[str, Any]], max_seq_len: int
+) -> list[dict[str, Any]]:
+    parsed: list[dict[str, Any]] = []
+    for row in rows:
+        prompt_text = _prompt_text(tokenizer, row)
+        completion_text = _completion_text(tokenizer, row.get("completion"))
+        label = row.get("label")
+        if label is None:
+            label = row.get("desirable")
+        if not prompt_text or not completion_text or label is None:
+            continue
+        target = _sequence_with_prompt_mask(
+            tokenizer, prompt_text, completion_text, max_seq_len
+        )
+        if target is None:
+            continue
+        parsed.append(
+            {
+                "prompt_text": prompt_text,
+                "completion_text": completion_text,
+                "target": target,
+                "desirable": bool(label),
+            }
+        )
+    examples: list[dict[str, Any]] = []
+    for index, item in enumerate(parsed):
+        example: dict[str, Any] = {
+            "target": item["target"],
+            "desirable": item["desirable"],
+        }
+        if len(parsed) > 1:
+            # KL baseline sequences pair each prompt with an unrelated
+            # completion, following the mismatched-pair estimate from the
+            # KTO paper.
+            other = parsed[(index + 1) % len(parsed)]
+            kl_sequence = _sequence_with_prompt_mask(
+                tokenizer,
+                item["prompt_text"],
+                other["completion_text"],
+                max_seq_len,
+            )
+            if kl_sequence is not None:
+                example["kl"] = kl_sequence
+        examples.append(example)
+    return examples
+
+
 def _render_messages(
     tokenizer: Any, messages: list[dict[str, Any]], *, add_generation_prompt: bool
 ) -> str:
@@ -558,6 +681,7 @@ def _render_messages(
         return "\n".join(
             f"{message.get('role', 'user')}: {message.get('content', '')}"
             for message in messages
+            if isinstance(message, dict)
         )
 
 
@@ -565,14 +689,15 @@ def _split_prompt_completion_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     for index in range(len(messages) - 1, -1, -1):
-        if str(messages[index].get("role") or "") == "assistant":
+        entry = messages[index]
+        if isinstance(entry, dict) and str(entry.get("role") or "") == "assistant":
             return messages[:index], messages[: index + 1]
     return [], messages
 
 
 def _prompt_text(tokenizer: Any, row: dict[str, Any]) -> str:
     prompt = row.get("prompt")
-    if prompt is not None:
+    if prompt:
         return str(prompt)
     messages = row.get("messages")
     if isinstance(messages, list) and messages:
@@ -601,22 +726,34 @@ def _tokenize_text(tokenizer: Any, text: str, *, max_seq_len: int) -> list[int]:
 def _sequence_with_prompt_mask(
     tokenizer: Any, prompt_text: str, completion_text: str, max_seq_len: int
 ) -> dict[str, list[int]] | None:
-    prompt_ids = _tokenize_text(tokenizer, prompt_text, max_seq_len=max_seq_len)
-    full_ids = _tokenize_text(
-        tokenizer, prompt_text + completion_text, max_seq_len=max_seq_len
-    )
-    if not full_ids:
+    # Tokenize prompt and completion separately so the mask boundary is exact
+    # (no BPE merge across it), and truncate the prompt from the left so the
+    # supervised completion tokens are always preserved.
+    completion_ids = [
+        int(token_id)
+        for token_id in tokenizer(completion_text, add_special_tokens=False).get(
+            "input_ids", []
+        )
+    ][:max_seq_len]
+    if not completion_ids:
         return None
-    prompt_len = min(len(prompt_ids), max(0, len(full_ids) - 1))
-    labels = list(full_ids)
-    for index in range(prompt_len):
-        labels[index] = -100
-    if not any(label != -100 for label in labels):
-        return None
-    return {"input_ids": full_ids, "labels": labels}
+    prompt_ids: list[int] = []
+    if prompt_text:
+        prompt_ids = [
+            int(token_id)
+            for token_id in tokenizer(prompt_text, add_special_tokens=False).get(
+                "input_ids", []
+            )
+        ]
+        budget = max_seq_len - len(completion_ids)
+        prompt_ids = prompt_ids[-budget:] if budget > 0 else []
+    return {
+        "input_ids": prompt_ids + completion_ids,
+        "labels": [-100] * len(prompt_ids) + completion_ids,
+    }
 
 
-def _model_load_kwargs(config: LiveLoraTrainerConfig) -> dict[str, Any]:
+def _model_load_kwargs(config: LoraTrainerConfig) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "trust_remote_code": config.trust_remote_code,
         "low_cpu_mem_usage": True,
@@ -684,7 +821,7 @@ def _install_masking_utils_compat() -> None:
     for name in ("create_causal_mask", "create_sliding_window_causal_mask"):
         function = getattr(masking_utils, name, None)
         if not callable(function) or getattr(
-            function, "_vllm_dflash_masking_compat", False
+            function, "_vllm_colocate_masking_compat", False
         ):
             continue
         try:
@@ -718,7 +855,7 @@ def _install_masking_utils_compat() -> None:
             return __function(*args, **kwargs)
 
         _compat_mask_function.__name__ = getattr(function, "__name__", name)
-        _compat_mask_function._vllm_dflash_masking_compat = True
+        _compat_mask_function._vllm_colocate_masking_compat = True
         setattr(masking_utils, name, _compat_mask_function)
 
 
@@ -730,7 +867,7 @@ def _install_fouroversix_linear_compat() -> None:
     cls = getattr(linear, "FourOverSixLinear", None)
     original_forward = getattr(cls, "forward", None)
     if not callable(original_forward) or getattr(
-        original_forward, "_vllm_dflash_contiguous_input", False
+        original_forward, "_vllm_colocate_contiguous_input", False
     ):
         return
 
@@ -753,7 +890,7 @@ def _install_fouroversix_linear_compat() -> None:
         ):
             if (
                 not getattr(input, "requires_grad", False)
-                and _env_bool_any(("VLLM_JETSPEC_MODELOPT_NVFP4_NATIVE_FIRST",), True)
+                and _env_bool_any(("VLLM_COLOCATE_MODELOPT_NVFP4_NATIVE_FIRST",), True)
             ):
                 try:
                     output = original_forward(self, input.unsqueeze(0), *args, **kwargs)
@@ -795,7 +932,7 @@ def _install_fouroversix_linear_compat() -> None:
             setattr(self, _FOUROVERSIX_FORCE_DEQUANTIZED_FORWARD_ATTR, True)
             return _fouroversix_dequantized_linear_forward(self, input, exc)
 
-    _compat_forward._vllm_dflash_contiguous_input = True
+    _compat_forward._vllm_colocate_contiguous_input = True
     cls.forward = _compat_forward
 
 
@@ -814,7 +951,7 @@ def _fouroversix_dequantized_linear_forward(
     if modelopt_state is not None:
         if (
             not getattr(flat_input, "requires_grad", False)
-            and _env_bool_any(("VLLM_JETSPEC_MODELOPT_NVFP4_CPU_FIRST",), False)
+            and _env_bool_any(("VLLM_COLOCATE_MODELOPT_NVFP4_CPU_FIRST",), False)
         ):
             cpu_output = _modelopt_nvfp4_cpu_linear_forward(
                 module,
@@ -952,7 +1089,7 @@ def _modelopt_nvfp4_cpu_linear_forward(
                 weight_tensor = weight_tensor.detach()
                 tensor_bytes = _tensor_nbytes(weight_tensor)
                 max_cache_bytes = _env_int(
-                    "VLLM_JETSPEC_LIVE_MODELOPT_CPU_DEQUANT_CACHE_MAX_BYTES",
+                    "VLLM_COLOCATE_MODELOPT_CPU_DEQUANT_CACHE_MAX_BYTES",
                     4 * 1024 * 1024 * 1024,
                 )
                 if (
@@ -1171,7 +1308,7 @@ def _log_fouroversix_fallback_mismatch_once(
     input_shape: tuple[int, ...],
     weight_shape: tuple[int, ...] | None,
 ) -> None:
-    marker = "_vllm_dflash_fouroversix_mismatch_logged"
+    marker = "_vllm_colocate_fouroversix_mismatch_logged"
     if getattr(module, marker, False):
         return
     setattr(module, marker, True)
@@ -1191,7 +1328,7 @@ def _maybe_cache_dequantized_weight(
 ) -> None:
     global _FOUROVERSIX_DEQUANTIZED_CACHE_BYTES
     max_cache_bytes = _env_int(
-        "VLLM_JETSPEC_LIVE_FOUROVERSIX_DEQUANT_CACHE_MAX_BYTES",
+        "VLLM_COLOCATE_FOUROVERSIX_DEQUANT_CACHE_MAX_BYTES",
         512 * 1024 * 1024,
     )
     if max_cache_bytes <= 0:
@@ -1406,7 +1543,7 @@ def _install_rotary_embedding_method_compat() -> None:
         import torch.nn as nn
     except Exception:
         return
-    marker = "_vllm_dflash_original_getattr_for_rope"
+    marker = "_vllm_colocate_original_getattr_for_rope"
     if hasattr(nn.Module, marker):
         return
     original_getattr = nn.Module.__getattr__
@@ -1496,7 +1633,7 @@ def _torch_dtype_from_name(name: str) -> Any | None:
     return aliases.get(normalized)
 
 
-def _training_quantization_config(config: LiveLoraTrainerConfig) -> Any | None:
+def _training_quantization_config(config: LoraTrainerConfig) -> Any | None:
     quantization = str(config.quantization or "auto").strip().lower()
     if quantization in {"", "none", "false", "off"}:
         return None
@@ -1530,7 +1667,7 @@ def _training_quantization_config(config: LiveLoraTrainerConfig) -> Any | None:
             backward_dtype="mxfp4",
             store_master_weights=True,
         )
-    raise ValueError(f"Unsupported live LoRA quantization mode: {config.quantization}")
+    raise ValueError(f"Unsupported LoRA training quantization mode: {config.quantization}")
 
 
 def _fouroversix_runtime_available() -> bool:
@@ -1560,7 +1697,7 @@ def _is_missing_training_dependency_exception(exc: BaseException) -> bool:
     )
 
 
-def _use_device_map(config: LiveLoraTrainerConfig) -> bool:
+def _use_device_map(config: LoraTrainerConfig) -> bool:
     mode = str(config.parallel_mode or "auto").replace("-", "_").lower()
     if mode in {"device_map", "model_parallel", "auto"}:
         try:
@@ -1686,6 +1823,25 @@ def _parent_module(model: Any, module_name: str) -> tuple[Any, str]:
 
 
 @contextlib.contextmanager
+def _dropout_disabled(model: Any):
+    """Preference losses (DPO/KTO) compare policy and reference passes;
+    dropout noise on only the policy side would bias the log-ratios."""
+    import torch
+
+    dropouts = [
+        module for module in model.modules() if isinstance(module, torch.nn.Dropout)
+    ]
+    previous = [module.training for module in dropouts]
+    try:
+        for module in dropouts:
+            module.eval()
+        yield
+    finally:
+        for module, was_training in zip(dropouts, previous):
+            module.train(was_training)
+
+
+@contextlib.contextmanager
 def _lora_disabled(model: Any):
     wrappers = [module for module in model.modules() if hasattr(module, "lora_A") and hasattr(module, "enabled")]
     previous = [bool(module.enabled) for module in wrappers]
@@ -1708,18 +1864,20 @@ def _first_parameter_device(model: Any, requested_device: str, torch: Any) -> An
     return torch.device("cpu")
 
 
-def _planned_steps(config: LiveLoraTrainerConfig, sft_count: int, dpo_count: int) -> int:
+def _planned_steps(config: LoraTrainerConfig, example_count: int) -> int:
     if config.max_steps > 0:
         return config.max_steps
-    example_count = max(sft_count, dpo_count, sft_count + dpo_count)
-    batches = max(1, math.ceil(example_count / max(1, config.batch_size)))
+    examples_per_step = max(1, config.batch_size) * max(
+        1, config.gradient_accumulation_steps
+    )
+    batches = max(1, math.ceil(max(1, example_count) / examples_per_step))
     return max(1, math.ceil(batches * max(0.0, config.train_epochs)))
 
 
-def _task_for_step(step: int, has_sft: bool, has_dpo: bool) -> str:
-    if has_sft and has_dpo:
-        return "dpo" if step % 2 else "sft"
-    return "dpo" if has_dpo else "sft"
+def _task_for_step(step: int, available_tasks: list[str]) -> str:
+    if not available_tasks:
+        raise ValueError("No training tasks available")
+    return available_tasks[step % len(available_tasks)]
 
 
 def _sft_batch_for_step(
@@ -1755,11 +1913,38 @@ def _dpo_batch_for_step(
     }
 
 
+def _kto_batch_for_step(
+    examples: list[dict[str, Any]],
+    step: int,
+    accum_index: int,
+    batch_size: int,
+    pad_token_id: int,
+    torch: Any,
+    device: Any,
+) -> dict[str, Any]:
+    selected = _select_examples(examples, step, accum_index, batch_size)
+    batch: dict[str, Any] = {
+        "target": _collate_token_examples(
+            [item["target"] for item in selected], pad_token_id, torch, device
+        ),
+        "desirable": torch.tensor(
+            [bool(item["desirable"]) for item in selected],
+            dtype=torch.bool,
+            device=device,
+        ),
+    }
+    kl_items = [item["kl"] for item in selected if item.get("kl") is not None]
+    if kl_items:
+        batch["kl"] = _collate_token_examples(kl_items, pad_token_id, torch, device)
+    return batch
+
+
 def _select_examples(
     examples: list[Any], step: int, accum_index: int, batch_size: int
 ) -> list[Any]:
     if not examples:
         raise ValueError("No examples available")
+    batch_size = max(1, batch_size)
     start = ((step * 9973) + accum_index * batch_size) % len(examples)
     selected = [examples[(start + offset) % len(examples)] for offset in range(batch_size)]
     if len(examples) > batch_size:
@@ -1832,6 +2017,7 @@ def _dpo_loss(
         model,
         chosen,
         loss_vocab_sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -1839,6 +2025,7 @@ def _dpo_loss(
         model,
         rejected,
         loss_vocab_sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -1847,6 +2034,7 @@ def _dpo_loss(
             model,
             chosen,
             loss_vocab_sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -1854,6 +2042,7 @@ def _dpo_loss(
             model,
             rejected,
             loss_vocab_sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -1881,6 +2070,7 @@ def _dpo_loss_with_shared_hidden(
         chosen,
         chosen_hidden,
         sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -1889,6 +2079,7 @@ def _dpo_loss_with_shared_hidden(
         rejected,
         rejected_hidden,
         sample_size=loss_vocab_sample_size,
+        average=False,
         torch=torch,
         F=F,
     )
@@ -1900,6 +2091,7 @@ def _dpo_loss_with_shared_hidden(
             chosen,
             chosen_hidden.detach(),
             sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -1908,6 +2100,7 @@ def _dpo_loss_with_shared_hidden(
             rejected,
             rejected_hidden.detach(),
             sample_size=loss_vocab_sample_size,
+            average=False,
             torch=torch,
             F=F,
         )
@@ -1922,11 +2115,76 @@ def _dpo_loss_with_shared_hidden(
     return -F.logsigmoid(logits).mean()
 
 
+def _kto_loss(
+    model: Any,
+    batch: dict[str, Any],
+    *,
+    beta: float,
+    desirable_weight: float,
+    undesirable_weight: float,
+    loss_vocab_sample_size: int = 0,
+    torch: Any,
+    F: Any,
+) -> Any:
+    target = batch["target"]
+    policy_logps = _sequence_logprob(
+        model,
+        target,
+        loss_vocab_sample_size=loss_vocab_sample_size,
+        average=False,
+        torch=torch,
+        F=F,
+    )
+    with torch.no_grad(), _lora_disabled(model):
+        ref_logps = _sequence_logprob(
+            model,
+            target,
+            loss_vocab_sample_size=loss_vocab_sample_size,
+            average=False,
+            torch=torch,
+            F=F,
+        )
+    kl_batch = batch.get("kl")
+    if kl_batch is not None:
+        with torch.no_grad():
+            policy_kl = _sequence_logprob(
+                model,
+                kl_batch,
+                loss_vocab_sample_size=loss_vocab_sample_size,
+                average=False,
+                torch=torch,
+                F=F,
+            )
+            with _lora_disabled(model):
+                ref_kl = _sequence_logprob(
+                    model,
+                    kl_batch,
+                    loss_vocab_sample_size=loss_vocab_sample_size,
+                    average=False,
+                    torch=torch,
+                    F=F,
+                )
+        kl = (policy_kl - ref_kl).float().mean().clamp(min=0.0)
+    else:
+        kl = policy_logps.detach().new_zeros(())
+    logratio = _zero_nonfinite((policy_logps - ref_logps).float(), torch=torch)
+    desirable = batch["desirable"].to(logratio.device)
+    desirable_losses = float(desirable_weight) * (
+        1.0 - torch.sigmoid(beta * (logratio - kl))
+    )
+    undesirable_losses = float(undesirable_weight) * (
+        1.0 - torch.sigmoid(beta * (kl - logratio))
+    )
+    losses = torch.where(desirable, desirable_losses, undesirable_losses)
+    return losses.mean()
+
+
 def _sequence_logprob(
     model: Any,
     batch: dict[str, Any],
     *,
     loss_vocab_sample_size: int = 0,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any:
@@ -1934,6 +2192,7 @@ def _sequence_logprob(
         model,
         batch,
         loss_vocab_sample_size=loss_vocab_sample_size,
+        average=average,
         torch=torch,
         F=F,
     )
@@ -1944,6 +2203,7 @@ def _sequence_nll(
     batch: dict[str, Any],
     *,
     loss_vocab_sample_size: int = 0,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any:
@@ -1952,6 +2212,7 @@ def _sequence_nll(
             model,
             batch,
             sample_size=loss_vocab_sample_size,
+            average=average,
             torch=torch,
             F=F,
         )
@@ -1962,7 +2223,9 @@ def _sequence_nll(
         attention_mask=batch["attention_mask"],
         use_cache=False,
     )
-    return _completion_nll(outputs.logits, batch["labels"], torch=torch, F=F)
+    return _completion_nll(
+        outputs.logits, batch["labels"], average=average, torch=torch, F=F
+    )
 
 
 def _sampled_completion_nll(
@@ -1970,6 +2233,7 @@ def _sampled_completion_nll(
     batch: dict[str, Any],
     *,
     sample_size: int,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any | None:
@@ -1979,6 +2243,7 @@ def _sampled_completion_nll(
         batch,
         hidden,
         sample_size=sample_size,
+        average=average,
         torch=torch,
         F=F,
     )
@@ -1990,6 +2255,7 @@ def _sampled_completion_nll_from_hidden(
     hidden: Any,
     *,
     sample_size: int,
+    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any | None:
@@ -2026,6 +2292,8 @@ def _sampled_completion_nll_from_hidden(
     ).squeeze(-1)
     token_nll = valid_logits.new_zeros(mask.shape)
     token_nll[mask] = token_nll_values
+    if not average:
+        return token_nll.sum(dim=1)
     denom = mask.sum(dim=1).clamp_min(1).to(token_nll.dtype)
     return token_nll.sum(dim=1) / denom
 
@@ -2249,7 +2517,9 @@ def _selected_linear_logits(
     return output.reshape(*input.shape[:-1], output.shape[-1])
 
 
-def _completion_nll(logits: Any, labels: Any, *, torch: Any, F: Any) -> Any:
+def _completion_nll(
+    logits: Any, labels: Any, *, average: bool = True, torch: Any, F: Any
+) -> Any:
     labels = labels.to(logits.device)
     shift_logits = logits[:, :-1, :].float()
     shift_labels = labels[:, 1:]
@@ -2258,11 +2528,13 @@ def _completion_nll(logits: Any, labels: Any, *, torch: Any, F: Any) -> Any:
     log_probs = F.log_softmax(shift_logits, dim=-1)
     token_log_probs = log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
     token_nll = -token_log_probs * mask.to(token_log_probs.dtype)
+    if not average:
+        return token_nll.sum(dim=1)
     return token_nll.sum(dim=1) / mask.sum(dim=1).clamp_min(1).to(token_nll.dtype)
 
 
 def _restore_latest(
-    config: LiveLoraTrainerConfig, model: Any, optimizer: Any | None
+    config: LoraTrainerConfig, model: Any, optimizer: Any | None
 ) -> int:
     latest = _read_json_file(config.checkpoint_dir / "latest.json")
     checkpoint = latest.get("checkpoint_path") or latest.get("checkpoint")
@@ -2276,7 +2548,7 @@ def _restore_latest(
 
         payload = torch.load(checkpoint_path, map_location="cpu")
     except Exception:
-        logger.exception("Failed to restore live LoRA checkpoint %s", checkpoint_path)
+        logger.exception("Failed to restore LoRA checkpoint %s", checkpoint_path)
         return 0
     state = payload.get("lora_state")
     if isinstance(state, dict):
@@ -2285,7 +2557,7 @@ def _restore_latest(
         try:
             optimizer.load_state_dict(payload["optimizer"])
         except Exception:
-            logger.warning("Could not restore live LoRA optimizer state", exc_info=True)
+            logger.warning("Could not restore LoRA optimizer state", exc_info=True)
     try:
         return int(payload.get("step") or latest.get("step") or 0)
     except (TypeError, ValueError):
@@ -2309,7 +2581,7 @@ def _load_lora_state(model: Any, state: dict[str, Any]) -> None:
 
 
 def _save(
-    config: LiveLoraTrainerConfig,
+    config: LoraTrainerConfig,
     model: Any,
     optimizer: Any | None,
     step: int,
@@ -2317,28 +2589,29 @@ def _save(
     import torch
 
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    adapter_dir = config.checkpoint_dir / "active_adapter"
+    adapter_dir = config.checkpoint_dir / f"adapter-step-{step:08d}"
     lora_state = _lora_state_dict(model)
+    lora_config = _adapter_config_payload(config, _injected_leaf_targets(lora_state))
     checkpoint_path = config.checkpoint_dir / f"checkpoint-step-{step:08d}.pt"
     tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
     payload = {
         "version": 1,
-        "trainer": "live_lora",
+        "trainer": "lora",
         "step": int(step),
         "model_name": config.model_name,
         "adapter_name": config.adapter_name,
         "saved_at": time.time(),
-        "lora_config": _adapter_config_payload(config),
+        "lora_config": lora_config,
         "lora_state": lora_state,
     }
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
     torch.save(payload, tmp_path)
     tmp_path.replace(checkpoint_path)
-    _export_peft_adapter(config, adapter_dir, lora_state)
+    _export_peft_adapter(config, adapter_dir, lora_state, lora_config)
     latest = {
         "version": 1,
-        "trainer": "live_lora",
+        "trainer": "lora",
         "checkpoint": checkpoint_path.name,
         "checkpoint_path": str(checkpoint_path),
         "adapter_path": str(adapter_dir),
@@ -2346,7 +2619,7 @@ def _save(
         "step": int(step),
         "saved_at": payload["saved_at"],
         "model_name": config.model_name,
-        "lora_config": _adapter_config_payload(config),
+        "lora_config": lora_config,
     }
     latest_path = config.checkpoint_dir / "latest.json"
     latest_tmp = latest_path.with_suffix(latest_path.suffix + ".tmp")
@@ -2366,7 +2639,13 @@ def _lora_state_dict(model: Any) -> dict[str, dict[str, Any]]:
     return state
 
 
-def _adapter_config_payload(config: LiveLoraTrainerConfig) -> dict[str, Any]:
+def _injected_leaf_targets(lora_state: dict[str, dict[str, Any]]) -> list[str]:
+    return sorted({module_name.rsplit(".", 1)[-1] for module_name in lora_state})
+
+
+def _adapter_config_payload(
+    config: LoraTrainerConfig, target_modules: list[str] | None = None
+) -> dict[str, Any]:
     return {
         "base_model_name_or_path": config.model_name,
         "peft_type": "LORA",
@@ -2374,7 +2653,11 @@ def _adapter_config_payload(config: LiveLoraTrainerConfig) -> dict[str, Any]:
         "r": int(config.lora_r),
         "lora_alpha": float(config.lora_alpha),
         "lora_dropout": float(config.lora_dropout),
-        "target_modules": list(config.lora_target_modules),
+        "target_modules": (
+            list(target_modules)
+            if target_modules
+            else list(config.lora_target_modules)
+        ),
         "bias": "none",
         "fan_in_fan_out": False,
         "inference_mode": True,
@@ -2382,46 +2665,46 @@ def _adapter_config_payload(config: LiveLoraTrainerConfig) -> dict[str, Any]:
 
 
 def _export_peft_adapter(
-    config: LiveLoraTrainerConfig,
+    config: LoraTrainerConfig,
     adapter_dir: Path,
     lora_state: dict[str, dict[str, Any]],
+    lora_config: dict[str, Any],
 ) -> None:
-    import torch
+    from safetensors.torch import save_file
 
+    if adapter_dir.exists():
+        # Same-step re-export: the weights are identical, and replacing the
+        # dir in place would race a concurrent vLLM adapter load.
+        return
     tmp_dir = adapter_dir.with_name(adapter_dir.name + ".tmp")
+    if tmp_dir.exists():
+        _remove_tree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     peft_state: dict[str, Any] = {}
     for module_name, tensors in lora_state.items():
-        peft_state[f"base_model.model.{module_name}.lora_A.weight"] = tensors["lora_A"]
-        peft_state[f"base_model.model.{module_name}.lora_B.weight"] = tensors["lora_B"]
-    torch.save(peft_state, tmp_dir / "adapter_model.bin")
+        prefix = f"base_model.model.{module_name}"
+        peft_state[f"{prefix}.lora_A.weight"] = tensors["lora_A"].contiguous()
+        peft_state[f"{prefix}.lora_B.weight"] = tensors["lora_B"].contiguous()
+    save_file(peft_state, str(tmp_dir / "adapter_model.safetensors"))
     (tmp_dir / "adapter_config.json").write_text(
-        json.dumps(_adapter_config_payload(config), indent=2) + "\n",
+        json.dumps(lora_config, indent=2) + "\n",
         encoding="utf-8",
     )
     (tmp_dir / "training_metadata.json").write_text(
         json.dumps(
             {
-                "trainer": "live_lora",
+                "trainer": "lora",
                 "adapter_name": config.adapter_name,
                 "model_name": config.model_name,
                 "exported_at": time.time(),
-                "state_format": "peft_lora_bin",
+                "state_format": "peft_lora_safetensors",
             },
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
-    if adapter_dir.exists():
-        backup = adapter_dir.with_name(adapter_dir.name + ".old")
-        if backup.exists():
-            _remove_tree(backup)
-        adapter_dir.replace(backup)
-        tmp_dir.replace(adapter_dir)
-        _remove_tree(backup)
-    else:
-        tmp_dir.replace(adapter_dir)
+    tmp_dir.replace(adapter_dir)
 
 
 def _remove_tree(path: Path) -> None:
@@ -2433,27 +2716,59 @@ def _remove_tree(path: Path) -> None:
     path.rmdir()
 
 
-def _prune_checkpoints(config: LiveLoraTrainerConfig) -> None:
+def _prune_checkpoints(config: LoraTrainerConfig) -> None:
     if config.keep_last_checkpoints <= 0:
         return
+    latest = _read_json_file(config.checkpoint_dir / "latest.json")
+
+    def _resolved(value: Any) -> Path | None:
+        if not value:
+            return None
+        path = Path(str(value))
+        return path if path.is_absolute() else config.checkpoint_dir / path
+
     checkpoints = sorted(
         config.checkpoint_dir.glob("checkpoint-step-*.pt"),
         key=lambda path: path.stat().st_mtime,
     )
     keep = set(checkpoints[-config.keep_last_checkpoints :])
-    latest = _read_json_file(config.checkpoint_dir / "latest.json")
-    latest_checkpoint = latest.get("checkpoint_path") or latest.get("checkpoint")
-    if latest_checkpoint:
-        latest_path = Path(str(latest_checkpoint))
-        if not latest_path.is_absolute():
-            latest_path = config.checkpoint_dir / latest_path
-        keep.add(latest_path)
+    latest_checkpoint = _resolved(
+        latest.get("checkpoint_path") or latest.get("checkpoint")
+    )
+    if latest_checkpoint is not None:
+        keep.add(latest_checkpoint)
     for checkpoint in checkpoints:
         if checkpoint not in keep:
             try:
                 checkpoint.unlink()
             except OSError:
                 logger.debug("Could not prune checkpoint %s", checkpoint, exc_info=True)
+
+    adapter_dirs = sorted(
+        (
+            path
+            for path in config.checkpoint_dir.glob("adapter-step-*")
+            if path.is_dir() and not path.name.endswith(".tmp")
+        ),
+        key=lambda path: path.stat().st_mtime,
+    )
+    keep_adapters = set(adapter_dirs[-config.keep_last_checkpoints :])
+    latest_adapter = _resolved(latest.get("adapter_path"))
+    if latest_adapter is not None:
+        keep_adapters.add(latest_adapter)
+    # Never delete the adapter the supervisor has loaded into vLLM.
+    active = _read_json_file(config.checkpoint_dir / "active_adapter.json")
+    active_adapter = _resolved(active.get("adapter_path"))
+    if active_adapter is not None:
+        keep_adapters.add(active_adapter)
+    for adapter_dir in adapter_dirs:
+        if adapter_dir not in keep_adapters:
+            try:
+                _remove_tree(adapter_dir)
+            except OSError:
+                logger.debug(
+                    "Could not prune adapter dir %s", adapter_dir, exc_info=True
+                )
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -2470,7 +2785,7 @@ def _stop_requested(stop_file: Path | None) -> bool:
     return stop_file.exists()
 
 
-def _write_metric(config: LiveLoraTrainerConfig, payload: dict[str, Any]) -> None:
+def _write_metric(config: LoraTrainerConfig, payload: dict[str, Any]) -> None:
     if config.metrics_path is None:
         return
     if int(os.getenv("RANK", "0") or 0) != 0:
@@ -2485,14 +2800,29 @@ def _write_metric(config: LiveLoraTrainerConfig, payload: dict[str, Any]) -> Non
         with config.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
     except OSError:
-        logger.exception("Failed to write live LoRA metric to %s", config.metrics_path)
+        logger.exception("Failed to write LoRA trainer metric to %s", config.metrics_path)
 
 
 def _configure_logging() -> None:
     logging.basicConfig(
-        level=os.getenv("VLLM_JETSPEC_LOG_LEVEL", "INFO").upper(),
+        level=os.getenv("VLLM_COLOCATE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+
+def _configure_torch_matmul_precision(torch: Any) -> None:
+    precision = (
+        os.getenv("VLLM_COLOCATE_TORCH_FLOAT32_MATMUL_PRECISION") or "high"
+    ).strip().lower()
+    if precision in {"", "0", "false", "off", "none"}:
+        return
+    if precision not in {"highest", "high", "medium"}:
+        logger.warning(
+            "Ignoring invalid VLLM_COLOCATE_TORCH_FLOAT32_MATMUL_PRECISION=%r",
+            precision,
+        )
+        return
+    torch.set_float32_matmul_precision(precision)
 
 
 def _env_first(*names: str, default: str | None = None) -> str | None:
@@ -2517,42 +2847,36 @@ def _split_csv(value: str | None) -> tuple[str, ...]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Raw torch live SFT/DPO LoRA trainer")
+    parser = argparse.ArgumentParser(description="Raw torch SFT/DPO/KTO LoRA trainer")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument(
         "--adapter-name",
         default=_env_first(
-            "VLLM_JETSPEC_LIVE_LORA_ADAPTER_NAME",
-            "VLLM_DFLASH_LIVE_LORA_ADAPTER_NAME",
-            default="live-lora",
+            "VLLM_COLOCATE_LORA_ADAPTER_NAME",
+            default="colocate-lora",
         ),
     )
     parser.add_argument(
         "--task-mix",
         default=_env_first(
-            "VLLM_JETSPEC_LIVE_TRAIN_TASK_MIX",
-            "VLLM_DFLASH_LIVE_TRAIN_TASK_MIX",
+            "VLLM_COLOCATE_TRAIN_TASK_MIX",
             default="mixed",
         ),
-        choices=("mixed", "sft", "dpo"),
+        choices=("mixed", "sft", "dpo", "kto"),
     )
     parser.add_argument(
         "--device",
         default=_env_first(
-            "VLLM_JETSPEC_LIVE_TRAIN_DEVICE",
-            "VLLM_DFLASH_LIVE_TRAIN_DEVICE",
-            "VLLM_JETSPEC_TRAIN_DEVICE",
-            "VLLM_DFLASH_TRAIN_DEVICE",
+            "VLLM_COLOCATE_TRAIN_DEVICE",
             default="cuda",
         ),
     )
     parser.add_argument(
         "--parallel-mode",
         default=_env_first(
-            "VLLM_JETSPEC_LIVE_TRAIN_PARALLEL_MODE",
-            "VLLM_DFLASH_LIVE_TRAIN_PARALLEL_MODE",
+            "VLLM_COLOCATE_TRAIN_PARALLEL_MODE",
             default="auto",
         ),
         choices=("auto", "none", "device_map", "model_parallel"),
@@ -2562,8 +2886,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_TRAIN_STEPS",
-                "VLLM_DFLASH_LIVE_TRAIN_STEPS",
+                "VLLM_COLOCATE_TRAIN_STEPS",
                 default="0",
             )
         ),
@@ -2573,8 +2896,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(
             _env_first(
-                "VLLM_JETSPEC_LIVE_TRAIN_EPOCHS",
-                "VLLM_DFLASH_LIVE_TRAIN_EPOCHS",
+                "VLLM_COLOCATE_TRAIN_EPOCHS",
                 default="1",
             )
         ),
@@ -2584,8 +2906,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_BATCH_SIZE",
-                "VLLM_DFLASH_LIVE_BATCH_SIZE",
+                "VLLM_COLOCATE_BATCH_SIZE",
                 default="1",
             )
         ),
@@ -2595,8 +2916,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_GRADIENT_ACCUMULATION_STEPS",
-                "VLLM_DFLASH_LIVE_GRADIENT_ACCUMULATION_STEPS",
+                "VLLM_COLOCATE_GRADIENT_ACCUMULATION_STEPS",
                 default="1",
             )
         ),
@@ -2606,8 +2926,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_MAX_SEQ_LEN",
-                "VLLM_DFLASH_LIVE_MAX_SEQ_LEN",
+                "VLLM_COLOCATE_MAX_SEQ_LEN",
                 default="2048",
             )
         ),
@@ -2617,8 +2936,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(
             _env_first(
-                "VLLM_JETSPEC_LIVE_LR",
-                "VLLM_DFLASH_LIVE_LR",
+                "VLLM_COLOCATE_LR",
                 default="0.0002",
             )
         ),
@@ -2628,8 +2946,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(
             _env_first(
-                "VLLM_JETSPEC_LIVE_WEIGHT_DECAY",
-                "VLLM_DFLASH_LIVE_WEIGHT_DECAY",
+                "VLLM_COLOCATE_WEIGHT_DECAY",
                 default="0",
             )
         ),
@@ -2639,8 +2956,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(
             _env_first(
-                "VLLM_JETSPEC_LIVE_MAX_GRAD_NORM",
-                "VLLM_DFLASH_LIVE_MAX_GRAD_NORM",
+                "VLLM_COLOCATE_MAX_GRAD_NORM",
                 default="1",
             )
         ),
@@ -2650,9 +2966,38 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(
             _env_first(
-                "VLLM_JETSPEC_LIVE_DPO_BETA",
-                "VLLM_DFLASH_LIVE_DPO_BETA",
+                "VLLM_COLOCATE_DPO_BETA",
                 default="0.1",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--kto-beta",
+        type=float,
+        default=float(
+            _env_first(
+                "VLLM_COLOCATE_KTO_BETA",
+                default="0.1",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--kto-desirable-weight",
+        type=float,
+        default=float(
+            _env_first(
+                "VLLM_COLOCATE_KTO_DESIRABLE_WEIGHT",
+                default="1.0",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--kto-undesirable-weight",
+        type=float,
+        default=float(
+            _env_first(
+                "VLLM_COLOCATE_KTO_UNDESIRABLE_WEIGHT",
+                default="1.0",
             )
         ),
     )
@@ -2661,8 +3006,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_LOSS_VOCAB_SAMPLE_SIZE",
-                "VLLM_DFLASH_LIVE_LOSS_VOCAB_SAMPLE_SIZE",
+                "VLLM_COLOCATE_LOSS_VOCAB_SAMPLE_SIZE",
                 default="0",
             )
         ),
@@ -2672,8 +3016,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_LORA_R",
-                "VLLM_DFLASH_LIVE_LORA_R",
+                "VLLM_COLOCATE_LORA_R",
                 default="16",
             )
         ),
@@ -2683,8 +3026,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(
             _env_first(
-                "VLLM_JETSPEC_LIVE_LORA_ALPHA",
-                "VLLM_DFLASH_LIVE_LORA_ALPHA",
+                "VLLM_COLOCATE_LORA_ALPHA",
                 default="32",
             )
         ),
@@ -2694,8 +3036,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(
             _env_first(
-                "VLLM_JETSPEC_LIVE_LORA_DROPOUT",
-                "VLLM_DFLASH_LIVE_LORA_DROPOUT",
+                "VLLM_COLOCATE_LORA_DROPOUT",
                 default="0.05",
             )
         ),
@@ -2703,8 +3044,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora-target-modules",
         default=_env_first(
-            "VLLM_JETSPEC_LIVE_LORA_TARGET_MODULES",
-            "VLLM_DFLASH_LIVE_LORA_TARGET_MODULES",
+            "VLLM_COLOCATE_LORA_TARGET_MODULES",
             default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,qkv_proj,gate_up_proj,wq,wk,wv,wo",
         ),
     )
@@ -2713,8 +3053,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=_env_bool_any(
             (
-                "VLLM_JETSPEC_LIVE_INCLUDE_EXPERT_LORA",
-                "VLLM_DFLASH_LIVE_INCLUDE_EXPERT_LORA",
+                "VLLM_COLOCATE_INCLUDE_EXPERT_LORA",
             ),
             False,
         ),
@@ -2722,16 +3061,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quantization",
         default=_env_first(
-            "VLLM_JETSPEC_LIVE_TRAIN_QUANTIZATION",
-            "VLLM_DFLASH_LIVE_TRAIN_QUANTIZATION",
+            "VLLM_COLOCATE_TRAIN_QUANTIZATION",
             default="auto",
         ),
     )
     parser.add_argument(
         "--torch-dtype",
         default=_env_first(
-            "VLLM_JETSPEC_LIVE_TORCH_DTYPE",
-            "VLLM_DFLASH_LIVE_TORCH_DTYPE",
+            "VLLM_COLOCATE_TORCH_DTYPE",
             default="bfloat16",
         ),
     )
@@ -2740,8 +3077,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=_env_bool_any(
             (
-                "VLLM_JETSPEC_TRUST_REMOTE_CODE",
-                "VLLM_DFLASH_TRUST_REMOTE_CODE",
+                "VLLM_COLOCATE_TRUST_REMOTE_CODE",
             ),
             True,
         ),
@@ -2751,8 +3087,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=_env_bool_any(
             (
-                "VLLM_JETSPEC_LIVE_SAVE_OPTIMIZER_STATE",
-                "VLLM_DFLASH_LIVE_SAVE_OPTIMIZER_STATE",
+                "VLLM_COLOCATE_SAVE_OPTIMIZER_STATE",
             ),
             True,
         ),
@@ -2762,8 +3097,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_CHECKPOINT_EVERY",
-                "VLLM_DFLASH_LIVE_CHECKPOINT_EVERY",
+                "VLLM_COLOCATE_CHECKPOINT_EVERY",
                 default="16",
             )
         ),
@@ -2773,18 +3107,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_KEEP_LAST_CHECKPOINTS",
-                "VLLM_DFLASH_LIVE_KEEP_LAST_CHECKPOINTS",
+                "VLLM_COLOCATE_KEEP_LAST_CHECKPOINTS",
                 default="2",
             )
         ),
     )
-    parser.add_argument("--stop-file", default=_env_first("VLLM_JETSPEC_STOP_FILE", "VLLM_DFLASH_STOP_FILE"))
-    parser.add_argument("--metrics-path", default=_env_first("VLLM_JETSPEC_METRICS_PATH", "VLLM_DFLASH_METRICS_PATH"))
+    parser.add_argument("--stop-file", default=_env_first("VLLM_COLOCATE_STOP_FILE"))
+    parser.add_argument("--metrics-path", default=_env_first("VLLM_COLOCATE_METRICS_PATH"))
     parser.add_argument(
         "--run-id",
         default=_env_first(
-            "VLLM_JETSPEC_TRAIN_RUN_ID", "VLLM_DFLASH_TRAIN_RUN_ID", default=""
+            "VLLM_COLOCATE_TRAIN_RUN_ID", default=""
         ),
     )
     parser.add_argument(
@@ -2792,10 +3125,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(
             _env_first(
-                "VLLM_JETSPEC_LIVE_TRAIN_LOG_EVERY",
-                "VLLM_DFLASH_LIVE_TRAIN_LOG_EVERY",
-                "VLLM_JETSPEC_TRAIN_LOG_EVERY",
-                "VLLM_DFLASH_TRAIN_LOG_EVERY",
+                "VLLM_COLOCATE_TRAIN_LOG_EVERY",
+                "VLLM_COLOCATE_TRAIN_LOG_EVERY",
                 default="1",
             )
         ),
@@ -2806,10 +3137,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     return run_training(
-        LiveLoraTrainerConfig(
+        LoraTrainerConfig(
             model_name=args.model_name,
             data_path=Path(args.data_path),
-            checkpoint_dir=Path(args.checkpoint_dir),
+            checkpoint_dir=Path(args.checkpoint_dir).resolve(),
             adapter_name=args.adapter_name,
             task_mix=args.task_mix,
             device=args.device,
@@ -2823,6 +3154,9 @@ def main() -> int:
             weight_decay=args.weight_decay,
             max_grad_norm=args.max_grad_norm,
             dpo_beta=args.dpo_beta,
+            kto_beta=args.kto_beta,
+            kto_desirable_weight=args.kto_desirable_weight,
+            kto_undesirable_weight=args.kto_undesirable_weight,
             loss_vocab_sample_size=args.loss_vocab_sample_size,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
