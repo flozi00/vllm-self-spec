@@ -180,11 +180,16 @@ class Settings:
     ready_timeout_seconds: float
     idle_grace_seconds: float
     sync_on_startup: bool
+    scheme: str = "http"
 
     @property
     def base_url(self) -> str:
-        host = self.host if self.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
-        return f"http://{host}:{self.port}"
+        host = self.host
+        if host in ("0.0.0.0", "::", "", None):
+            host = "127.0.0.1"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{self.scheme}://{host}:{self.port}"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -263,6 +268,10 @@ class Settings:
 _GATE_EXCLUDED_PATHS = frozenset(
     {"/v1/load_lora_adapter", "/v1/unload_lora_adapter"}
 )
+# Engine-touching endpoints that live outside /v1/ across vLLM versions.
+_GATE_EXTRA_INFERENCE_PATHS = frozenset(
+    {"/invocations", "/pooling", "/classify", "/score", "/rerank", "/v2/rerank"}
+)
 _GATE_IDLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
@@ -282,12 +291,16 @@ class InFlightGate:
 
     @staticmethod
     def _counts(scope: dict[str, Any]) -> bool:
+        """Only requests that can occupy the GPUs count as inference: writes
+        under /v1/ plus the known engine endpoints outside it. CPU-only
+        routes (/tokenize, /train/sft, probes) and junk traffic to unknown
+        paths must not starve training."""
         if scope.get("method", "GET").upper() in _GATE_IDLE_METHODS:
             return False
         path = scope.get("path", "")
-        if path in _GATE_EXCLUDED_PATHS or path.startswith("/train"):
+        if path in _GATE_EXCLUDED_PATHS:
             return False
-        return True
+        return path.startswith("/v1/") or path in _GATE_EXTRA_INFERENCE_PATHS
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http" or not self._counts(scope):
@@ -403,7 +416,9 @@ def _extract_options(payload: Any) -> dict[str, Any]:
         ):
             errors.append(f"option {key!r} must be >= 1")
     if errors:
-        raise HTTPException(status_code=400, detail={"errors": errors[:5]})
+        # vLLM's app-wide HTTPException handler assumes a string detail, so
+        # a structured detail would surface as an opaque 500.
+        raise HTTPException(status_code=400, detail="; ".join(errors[:5]))
     return options
 
 
@@ -460,6 +475,21 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _trainer_preexec() -> None:  # pragma: no cover - runs in the forked child
+    """Deliver SIGTERM to the trainer when this server process dies, so a
+    SIGKILLed supervisor cannot leave an orphan pinning GPU memory or
+    waiting forever on a stale pause file. Linux prctl; best effort — the
+    trainer also watches its parent pid as a portable fallback."""
+    try:
+        import ctypes
+        import signal as _signal
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, _signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
 
 
 class TrainingManager:
@@ -524,7 +554,7 @@ class TrainingManager:
             if len(errors) >= 5:
                 break
         if errors:
-            raise HTTPException(status_code=400, detail={"errors": errors})
+            raise HTTPException(status_code=400, detail="; ".join(errors))
         job_id = f"sft-{uuid.uuid4().hex[:12]}"
         data_path = self.settings.jobs_dir / f"{job_id}.jsonl"
         await asyncio.to_thread(_write_job_rows, data_path, samples)
@@ -547,22 +577,23 @@ class TrainingManager:
         """Mirror inference activity into the trainer pause file.
 
         The trainer polls the file between steps: present = pause, absent =
-        train. Toggled only on transitions so the loop is one stat-free
-        comparison most of the time.
+        train. The on-disk state is enforced every tick (not just on
+        transitions) so an externally deleted or leftover file — e.g. a
+        second instance's boot cleanup — is repaired within a tick.
         """
         pause_file = self.settings.pause_file
         while True:
             busy = InFlightGate.busy(self.settings.idle_grace_seconds)
-            if busy != self.trainer_paused:
-                try:
-                    if busy:
+            try:
+                if busy:
+                    if not pause_file.exists():
                         pause_file.parent.mkdir(parents=True, exist_ok=True)
                         pause_file.touch()
-                    else:
-                        pause_file.unlink(missing_ok=True)
-                    self.trainer_paused = busy
-                except OSError:
-                    logger.warning("Could not update trainer pause file")
+                else:
+                    pause_file.unlink(missing_ok=True)
+                self.trainer_paused = busy
+            except OSError:
+                logger.warning("Could not update trainer pause file")
             await asyncio.sleep(0.25)
 
     # --------------------------------------------------------------- worker
@@ -591,7 +622,9 @@ class TrainingManager:
         env = self._trainer_env()
         logger.info("Starting training job %s: %s", job.id, shlex.join(cmd))
         try:
-            process = await asyncio.create_subprocess_exec(*cmd, env=env)
+            process = await asyncio.create_subprocess_exec(
+                *cmd, env=env, preexec_fn=_trainer_preexec
+            )
         except OSError as exc:
             job.status = "failed"
             job.error = f"could not start trainer: {exc}"
@@ -702,15 +735,20 @@ class TrainingManager:
             return None
         return path
 
+    def _self_client(self, timeout: float) -> httpx.AsyncClient:
+        # Loopback self-calls: never route through HTTP(S)_PROXY env, and
+        # skip cert verification (a TLS cert won't be issued for 127.0.0.1).
+        return httpx.AsyncClient(timeout=timeout, trust_env=False, verify=False)
+
     async def wait_server_ready(self, timeout_seconds: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_seconds)
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with self._self_client(10.0) as client:
             while time.monotonic() < deadline:
                 try:
                     response = await client.get(f"{self.settings.base_url}/health")
                     if response.status_code == 200:
                         return True
-                except httpx.HTTPError:
+                except (httpx.HTTPError, httpx.InvalidURL):
                     pass
                 await asyncio.sleep(2)
         return False
@@ -718,10 +756,37 @@ class TrainingManager:
     async def _load_lora_adapter(
         self, *, adapter_name: str, adapter_path: Path
     ) -> tuple[bool, str | None]:
-        payload = {"lora_name": adapter_name, "lora_path": str(adapter_path)}
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            # Unload-then-load works on every vLLM version; a missing name
-            # just 404s, which is fine.
+        load_url = f"{self.settings.base_url}/v1/load_lora_adapter"
+        async with self._self_client(300.0) as client:
+            # Newer vLLM swaps atomically with load_inplace (no window where
+            # the adapter name 404s); older vLLM ignores the extra field and
+            # rejects a loaded name, so fall back to unload-then-load there.
+            try:
+                response = await client.post(
+                    load_url,
+                    json={
+                        "lora_name": adapter_name,
+                        "lora_path": str(adapter_path),
+                        "load_inplace": True,
+                    },
+                )
+                if response.status_code < 400:
+                    return True, None
+                if (
+                    response.status_code != 422
+                    and "already been loaded" not in response.text
+                ):
+                    # A real load failure (bad path, bad adapter): keep the
+                    # currently loaded adapter instead of unloading it only
+                    # to fail the same way again.
+                    return (
+                        False,
+                        f"vLLM rejected adapter load "
+                        f"status={response.status_code} "
+                        f"body={response.text[:500]}",
+                    )
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                return False, f"load_lora_adapter request failed: {exc}"
             try:
                 await client.post(
                     f"{self.settings.base_url}/v1/unload_lora_adapter",
@@ -731,10 +796,10 @@ class TrainingManager:
                 pass
             try:
                 response = await client.post(
-                    f"{self.settings.base_url}/v1/load_lora_adapter",
-                    json=payload,
+                    load_url,
+                    json={"lora_name": adapter_name, "lora_path": str(adapter_path)},
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 return False, f"load_lora_adapter request failed: {exc}"
         if response.status_code < 400:
             return True, None
@@ -973,6 +1038,12 @@ def _parse_vllm_args(cli_args: Any, parser_cls: Any) -> Any:
     parser = cli_args.make_arg_parser(
         parser_cls(description="vLLM inference + colocated SFT LoRA training")
     )
+    # vLLM 0.9.x only defined the model_tag positional on the `vllm serve`
+    # subparser; add it so the documented positional form works everywhere.
+    if not any(
+        getattr(action, "dest", "") == "model_tag" for action in parser._actions
+    ):
+        parser.add_argument("model_tag", type=str, nargs="?")
     argv = _build_vllm_argv()
     args = parser.parse_args(argv)
     model_flag_given = any(
@@ -980,14 +1051,23 @@ def _parse_vllm_args(cli_args: Any, parser_cls: Any) -> Any:
     )
     if getattr(args, "model_tag", None):
         args.model = args.model_tag
-    elif not model_flag_given:
-        # No model on the command line: use the env setting instead of
-        # vLLM's placeholder default.
+    elif not model_flag_given and getattr(args, "model", None) == parser.get_default(
+        "model"
+    ):
+        # Model still at vLLM's placeholder default and not set via --model
+        # or a --config file: use the env setting. (Comparing against the
+        # parser default keeps a --config-provided model intact — config
+        # expansion happens inside parse_args, invisible to the raw argv.)
         args.model = settings.model_name
     if getattr(args, "headless", False):
         raise SystemExit(
             "--headless runs no API server, so the /train/sft route cannot "
             "exist; remove the flag."
+        )
+    if getattr(args, "uds", None):
+        raise SystemExit(
+            "--uds is not supported: the training gate and adapter sync "
+            "talk to the server over local TCP; remove the flag."
         )
     # The training route, the in-flight gate, and runtime LoRA updates all
     # need the one in-process API server.
@@ -1006,27 +1086,36 @@ def _parse_vllm_args(cli_args: Any, parser_cls: Any) -> Any:
 
 
 def _reconcile_network_settings(args: Any) -> None:
-    """The user may override --host/--port through CLI passthrough or extra
-    args; the self-calls (health poll, adapter loads) must follow."""
+    """The user may override --host/--port or enable TLS through CLI
+    passthrough or extra args; the self-calls (health poll, adapter loads)
+    must follow."""
     global settings
     host = getattr(args, "host", None) or settings.host
     port = int(getattr(args, "port", None) or settings.port)
-    if (host, port) != (settings.host, settings.port):
-        settings = replace(settings, host=host, port=port)
+    scheme = (
+        "https"
+        if getattr(args, "ssl_keyfile", None) or getattr(args, "ssl_certfile", None)
+        else "http"
+    )
+    if (host, port, scheme) != (settings.host, settings.port, settings.scheme):
+        settings = replace(settings, host=host, port=port, scheme=scheme)
         manager.settings = settings
 
 
 async def _startup() -> None:
     """Runs on the server's event loop: start the manager, then restore the
     last trained adapter once vLLM answers /health."""
-    manager.start()
-    if not settings.sync_on_startup:
-        return
-    if not await manager.wait_server_ready(settings.ready_timeout_seconds):
-        logger.warning("vLLM never became ready; skipping adapter restore")
-        return
-    if manager.resolve_adapter_path() is not None:
-        await manager.sync_adapter()
+    try:
+        manager.start()
+        if not settings.sync_on_startup:
+            return
+        if not await manager.wait_server_ready(settings.ready_timeout_seconds):
+            logger.warning("vLLM never became ready; skipping adapter restore")
+            return
+        if manager.resolve_adapter_path() is not None:
+            await manager.sync_adapter()
+    except Exception:
+        logger.exception("Startup task failed")
 
 
 async def _serve(entry: Any, args: Any) -> None:

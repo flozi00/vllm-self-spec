@@ -16,12 +16,36 @@ from typing import Any, Iterable
 
 
 _TERMINATION_REQUESTED = False
+_INITIAL_PARENT_PID = os.getppid()
 logger = logging.getLogger("vllm_colocate.lora_trainer")
 
 
 def _handle_termination_signal(_signum: int, _frame: Any | None) -> None:
     global _TERMINATION_REQUESTED
     _TERMINATION_REQUESTED = True
+
+
+def _parent_exited() -> bool:
+    """The supervisor sets PR_SET_PDEATHSIG where available; this is the
+    portable fallback so an orphaned trainer (supervisor SIGKILLed) stops,
+    saves its checkpoint, and releases the GPUs instead of training
+    unsupervised or waiting forever on a stale pause file."""
+    return os.getppid() != _INITIAL_PARENT_PID
+
+
+_PARENT_EXIT_LOGGED = False
+
+
+def _stop_or_orphaned(config: "LoraTrainerConfig") -> bool:
+    global _PARENT_EXIT_LOGGED
+    if _TERMINATION_REQUESTED or _stop_requested(config.stop_file):
+        return True
+    if _parent_exited():
+        if not _PARENT_EXIT_LOGGED:
+            _PARENT_EXIT_LOGGED = True
+            logger.warning("LoRA trainer parent process exited; stopping")
+        return True
+    return False
 
 
 def _install_signal_handlers() -> None:
@@ -339,7 +363,7 @@ def run_training(config: LoraTrainerConfig) -> int:
         # Yield the GPUs to inference: block while the supervisor's pause
         # file exists, then check for a stop that may have arrived meanwhile.
         paused_seconds += _wait_while_paused(config, primary=primary)
-        if _TERMINATION_REQUESTED or _stop_requested(config.stop_file):
+        if _stop_or_orphaned(config):
             logger.info("LoRA trainer stopping at local_step=%d", local_step)
             break
         example_step = step + local_step
@@ -440,7 +464,7 @@ def run_training(config: LoraTrainerConfig) -> int:
             "completed_steps": completed_steps,
             "max_steps": planned_steps,
             "loss": last_loss,
-            "stopped": _TERMINATION_REQUESTED or _stop_requested(config.stop_file),
+            "stopped": _stop_or_orphaned(config),
             "elapsed_seconds": time.time() - run_started,
             "paused_seconds": paused_seconds,
         },
@@ -2303,7 +2327,7 @@ def _wait_while_paused(config: LoraTrainerConfig, *, primary: bool) -> float:
     if primary:
         logger.info("LoRA trainer paused: inference is busy")
     while _pause_requested(config.pause_file):
-        if _TERMINATION_REQUESTED or _stop_requested(config.stop_file):
+        if _stop_or_orphaned(config):
             break
         time.sleep(0.5)
     waited = time.monotonic() - started
