@@ -38,7 +38,6 @@ class LoraTrainerConfig:
     data_path: Path
     checkpoint_dir: Path
     adapter_name: str
-    task_mix: str = "mixed"
     device: str = "cuda"
     parallel_mode: str = "auto"
     max_steps: int = 0
@@ -49,10 +48,6 @@ class LoraTrainerConfig:
     learning_rate: float = 2e-4
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
-    dpo_beta: float = 0.1
-    kto_beta: float = 0.1
-    kto_desirable_weight: float = 1.0
-    kto_undesirable_weight: float = 1.0
     loss_vocab_sample_size: int = 0
     lora_r: int = 16
     lora_alpha: float = 32.0
@@ -74,6 +69,7 @@ class LoraTrainerConfig:
     checkpoint_every: int = 16
     keep_last_checkpoints: int = 2
     stop_file: Path | None = None
+    pause_file: Path | None = None
     metrics_path: Path | None = None
     run_id: str = ""
     log_every: int = 1
@@ -156,33 +152,19 @@ def run_training(config: LoraTrainerConfig) -> int:
     local_rank = int(os.getenv("LOCAL_RANK", "0") or 0)
     primary = rank == 0
 
-    rows = _load_training_rows(config.data_path)
-    rows_by_task = {
-        task: [row for row in rows if row.get("task") == task]
-        for task in ("sft", "dpo", "kto")
-    }
-    if config.task_mix in rows_by_task:
-        rows_by_task = {
-            task: (task_rows if task == config.task_mix else [])
-            for task, task_rows in rows_by_task.items()
-        }
-    sft_rows = rows_by_task["sft"]
-    dpo_rows = rows_by_task["dpo"]
-    kto_rows = rows_by_task["kto"]
-    if not sft_rows and not dpo_rows and not kto_rows:
-        logger.error("LoRA trainer found no SFT/DPO/KTO rows at %s", config.data_path)
+    sft_rows = _load_training_rows(config.data_path)
+    if not sft_rows:
+        logger.error("LoRA trainer found no SFT rows at %s", config.data_path)
         _write_metric(config, {"event": "not_enough_examples", "examples": 0})
         return 3
 
     logger.info(
-        "LoRA trainer starting run_id=%s model=%s data_path=%s checkpoint_dir=%s sft_rows=%d dpo_rows=%d kto_rows=%d parallel_mode=%s rank=%d local_rank=%d",
+        "LoRA trainer starting run_id=%s model=%s data_path=%s checkpoint_dir=%s sft_rows=%d parallel_mode=%s rank=%d local_rank=%d",
         config.run_id or "-",
         config.model_name,
         config.data_path,
         config.checkpoint_dir,
         len(sft_rows),
-        len(dpo_rows),
-        len(kto_rows),
         config.parallel_mode,
         rank,
         local_rank,
@@ -197,9 +179,6 @@ def run_training(config: LoraTrainerConfig) -> int:
             "checkpoint_dir": str(config.checkpoint_dir),
             "adapter_name": config.adapter_name,
             "sft_rows": len(sft_rows),
-            "dpo_rows": len(dpo_rows),
-            "kto_rows": len(kto_rows),
-            "task_mix": config.task_mix,
             "parallel_mode": config.parallel_mode,
             "rank": rank,
             "local_rank": local_rank,
@@ -209,10 +188,6 @@ def run_training(config: LoraTrainerConfig) -> int:
             "train_epochs": config.train_epochs,
             "max_seq_len": config.max_seq_len,
             "learning_rate": config.learning_rate,
-            "dpo_beta": config.dpo_beta,
-            "kto_beta": config.kto_beta,
-            "kto_desirable_weight": config.kto_desirable_weight,
-            "kto_undesirable_weight": config.kto_undesirable_weight,
             "loss_vocab_sample_size": config.loss_vocab_sample_size,
             "lora_r": config.lora_r,
             "lora_alpha": config.lora_alpha,
@@ -237,15 +212,8 @@ def run_training(config: LoraTrainerConfig) -> int:
         for example in [_build_sft_example(tokenizer, row, config.max_seq_len)]
         if example is not None
     ]
-    dpo_examples = [
-        example
-        for row in dpo_rows
-        for example in [_build_dpo_example(tokenizer, row, config.max_seq_len)]
-        if example is not None
-    ]
-    kto_examples = _build_kto_examples(tokenizer, kto_rows, config.max_seq_len)
-    if not sft_examples and not dpo_examples and not kto_examples:
-        logger.error("LoRA trainer could not tokenize any SFT/DPO/KTO examples")
+    if not sft_examples:
+        logger.error("LoRA trainer could not tokenize any SFT examples")
         _write_metric(config, {"event": "not_enough_tokenized_examples", "examples": 0})
         return 3
 
@@ -345,18 +313,7 @@ def run_training(config: LoraTrainerConfig) -> int:
     first_device = _first_parameter_device(model, config.device, torch)
     model.train()
 
-    planned_steps = _planned_steps(
-        config, len(sft_examples) + len(dpo_examples) + len(kto_examples)
-    )
-    available_tasks = [
-        task
-        for task, examples in (
-            ("sft", sft_examples),
-            ("dpo", dpo_examples),
-            ("kto", kto_examples),
-        )
-        if examples
-    ]
+    planned_steps = _planned_steps(config, len(sft_examples))
     if step > 0:
         logger.info("LoRA trainer restored checkpoint at global_step=%d", step)
     _write_metric(
@@ -365,8 +322,6 @@ def run_training(config: LoraTrainerConfig) -> int:
             "event": "ready",
             "trainer": "lora",
             "sft_examples": len(sft_examples),
-            "dpo_examples": len(dpo_examples),
-            "kto_examples": len(kto_examples),
             "lora_modules": sorted(wrappers),
             "trainable_parameters": sum(parameter.numel() for parameter in trainable_parameters),
             "restored_step": step,
@@ -377,79 +332,40 @@ def run_training(config: LoraTrainerConfig) -> int:
 
     completed_steps = 0
     last_loss = None
+    paused_seconds = 0.0
     accum = max(1, config.gradient_accumulation_steps)
     optimizer.zero_grad(set_to_none=True)
     for local_step in range(planned_steps):
+        # Yield the GPUs to inference: block while the supervisor's pause
+        # file exists, then check for a stop that may have arrived meanwhile.
+        paused_seconds += _wait_while_paused(config, primary=primary)
         if _TERMINATION_REQUESTED or _stop_requested(config.stop_file):
             logger.info("LoRA trainer stopping at local_step=%d", local_step)
             break
-        task = _task_for_step(local_step, available_tasks)
-        # Decouple the example-selection counter from the task stride so a
-        # task visited every len(available_tasks) steps still walks through
-        # its whole dataset instead of aliasing onto a subset.
-        task_step = (step + local_step) // len(available_tasks)
+        example_step = step + local_step
         loss_value = 0.0
         for accum_index in range(accum):
-            if task == "dpo":
-                batch = _dpo_batch_for_step(
-                    dpo_examples,
-                    task_step,
-                    accum_index,
-                    config.batch_size,
-                    tokenizer.pad_token_id,
-                    torch,
-                    first_device,
-                )
-                with _dropout_disabled(model):
-                    loss = _dpo_loss(
-                        model,
-                        batch,
-                        beta=config.dpo_beta,
-                        loss_vocab_sample_size=config.loss_vocab_sample_size,
-                        torch=torch,
-                        F=F,
-                    )
-            elif task == "kto":
-                batch = _kto_batch_for_step(
-                    kto_examples,
-                    task_step,
-                    accum_index,
-                    config.batch_size,
-                    tokenizer.pad_token_id,
-                    torch,
-                    first_device,
-                )
-                with _dropout_disabled(model):
-                    loss = _kto_loss(
-                        model,
-                        batch,
-                        beta=config.kto_beta,
-                        desirable_weight=config.kto_desirable_weight,
-                        undesirable_weight=config.kto_undesirable_weight,
-                        loss_vocab_sample_size=config.loss_vocab_sample_size,
-                        torch=torch,
-                        F=F,
-                    )
-            else:
-                batch = _sft_batch_for_step(
-                    sft_examples,
-                    task_step,
-                    accum_index,
-                    config.batch_size,
-                    tokenizer.pad_token_id,
-                    torch,
-                    first_device,
-                )
-                loss = _sft_loss(
-                    model,
-                    batch,
-                    loss_vocab_sample_size=config.loss_vocab_sample_size,
-                    torch=torch,
-                    F=F,
-                )
+            if accum_index:
+                paused_seconds += _wait_while_paused(config, primary=primary)
+            batch = _sft_batch_for_step(
+                sft_examples,
+                example_step,
+                accum_index,
+                config.batch_size,
+                tokenizer.pad_token_id,
+                torch,
+                first_device,
+            )
+            loss = _sft_loss(
+                model,
+                batch,
+                loss_vocab_sample_size=config.loss_vocab_sample_size,
+                torch=torch,
+                F=F,
+            )
             if not bool(torch.isfinite(loss.detach()).all().cpu()):
                 raise RuntimeError(
-                    f"LoRA trainer produced non-finite {task} loss "
+                    f"LoRA trainer produced non-finite loss "
                     f"at local_step={local_step} accum_index={accum_index}"
                 )
             (loss / accum).backward()
@@ -458,10 +374,9 @@ def run_training(config: LoraTrainerConfig) -> int:
         if sanitized_gradients:
             logger.warning(
                 "LoRA trainer sanitized %d non-finite gradient tensor(s) "
-                "at local_step=%d task=%s",
+                "at local_step=%d",
                 sanitized_gradients,
                 local_step,
-                task,
             )
         if config.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(trainable_parameters, config.max_grad_norm)
@@ -470,10 +385,9 @@ def run_training(config: LoraTrainerConfig) -> int:
         if sanitized_optimizer_states:
             logger.warning(
                 "LoRA trainer sanitized %d non-finite optimizer state tensor(s) "
-                "at local_step=%d task=%s",
+                "at local_step=%d",
                 sanitized_optimizer_states,
                 local_step,
-                task,
             )
         optimizer.zero_grad(set_to_none=True)
         completed_steps += 1
@@ -485,12 +399,12 @@ def run_training(config: LoraTrainerConfig) -> int:
             elapsed = time.time() - run_started
             progress = completed_steps / max(1, planned_steps)
             logger.info(
-                "LoRA trainer step %d/%d task=%s loss=%.4f elapsed=%.1fs",
+                "LoRA trainer step %d/%d loss=%.4f elapsed=%.1fs paused=%.1fs",
                 completed_steps,
                 planned_steps,
-                task,
                 last_loss,
                 elapsed,
+                paused_seconds,
             )
             _write_metric(
                 config,
@@ -501,9 +415,10 @@ def run_training(config: LoraTrainerConfig) -> int:
                     "local_step": completed_steps,
                     "max_steps": planned_steps,
                     "progress": progress,
-                    "task": task,
+                    "task": "sft",
                     "loss": last_loss,
                     "elapsed_seconds": elapsed,
+                    "paused_seconds": paused_seconds,
                 },
             )
         if primary and config.checkpoint_every > 0 and global_step % config.checkpoint_every == 0:
@@ -527,6 +442,7 @@ def run_training(config: LoraTrainerConfig) -> int:
             "loss": last_loss,
             "stopped": _TERMINATION_REQUESTED or _stop_requested(config.stop_file),
             "elapsed_seconds": time.time() - run_started,
+            "paused_seconds": paused_seconds,
         },
     )
     return 0
@@ -543,7 +459,7 @@ def _load_training_rows(path: Path) -> list[dict[str, Any]]:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(row, dict) and row.get("task") in {"sft", "dpo", "kto"}:
+                if isinstance(row, dict) and row.get("task") in {"sft", None}:
                     rows.append(row)
     except FileNotFoundError:
         return []
@@ -605,69 +521,6 @@ def _build_sft_example(
     return None
 
 
-def _build_dpo_example(
-    tokenizer: Any, row: dict[str, Any], max_seq_len: int
-) -> dict[str, dict[str, list[int]]] | None:
-    prompt_text = _prompt_text(tokenizer, row)
-    chosen_text = _completion_text(tokenizer, row.get("chosen"))
-    rejected_text = _completion_text(tokenizer, row.get("rejected"))
-    if not prompt_text or not chosen_text or not rejected_text:
-        return None
-    chosen = _sequence_with_prompt_mask(tokenizer, prompt_text, chosen_text, max_seq_len)
-    rejected = _sequence_with_prompt_mask(tokenizer, prompt_text, rejected_text, max_seq_len)
-    if chosen is None or rejected is None:
-        return None
-    return {"chosen": chosen, "rejected": rejected}
-
-
-def _build_kto_examples(
-    tokenizer: Any, rows: list[dict[str, Any]], max_seq_len: int
-) -> list[dict[str, Any]]:
-    parsed: list[dict[str, Any]] = []
-    for row in rows:
-        prompt_text = _prompt_text(tokenizer, row)
-        completion_text = _completion_text(tokenizer, row.get("completion"))
-        label = row.get("label")
-        if label is None:
-            label = row.get("desirable")
-        if not prompt_text or not completion_text or label is None:
-            continue
-        target = _sequence_with_prompt_mask(
-            tokenizer, prompt_text, completion_text, max_seq_len
-        )
-        if target is None:
-            continue
-        parsed.append(
-            {
-                "prompt_text": prompt_text,
-                "completion_text": completion_text,
-                "target": target,
-                "desirable": bool(label),
-            }
-        )
-    examples: list[dict[str, Any]] = []
-    for index, item in enumerate(parsed):
-        example: dict[str, Any] = {
-            "target": item["target"],
-            "desirable": item["desirable"],
-        }
-        if len(parsed) > 1:
-            # KL baseline sequences pair each prompt with an unrelated
-            # completion, following the mismatched-pair estimate from the
-            # KTO paper.
-            other = parsed[(index + 1) % len(parsed)]
-            kl_sequence = _sequence_with_prompt_mask(
-                tokenizer,
-                item["prompt_text"],
-                other["completion_text"],
-                max_seq_len,
-            )
-            if kl_sequence is not None:
-                example["kl"] = kl_sequence
-        examples.append(example)
-    return examples
-
-
 def _render_messages(
     tokenizer: Any, messages: list[dict[str, Any]], *, add_generation_prompt: bool
 ) -> str:
@@ -693,16 +546,6 @@ def _split_prompt_completion_messages(
         if isinstance(entry, dict) and str(entry.get("role") or "") == "assistant":
             return messages[:index], messages[: index + 1]
     return [], messages
-
-
-def _prompt_text(tokenizer: Any, row: dict[str, Any]) -> str:
-    prompt = row.get("prompt")
-    if prompt:
-        return str(prompt)
-    messages = row.get("messages")
-    if isinstance(messages, list) and messages:
-        return _render_messages(tokenizer, messages, add_generation_prompt=True)
-    return ""
 
 
 def _completion_text(tokenizer: Any, value: Any) -> str:
@@ -1822,38 +1665,6 @@ def _parent_module(model: Any, module_name: str) -> tuple[Any, str]:
     return parent, parts[-1]
 
 
-@contextlib.contextmanager
-def _dropout_disabled(model: Any):
-    """Preference losses (DPO/KTO) compare policy and reference passes;
-    dropout noise on only the policy side would bias the log-ratios."""
-    import torch
-
-    dropouts = [
-        module for module in model.modules() if isinstance(module, torch.nn.Dropout)
-    ]
-    previous = [module.training for module in dropouts]
-    try:
-        for module in dropouts:
-            module.eval()
-        yield
-    finally:
-        for module, was_training in zip(dropouts, previous):
-            module.train(was_training)
-
-
-@contextlib.contextmanager
-def _lora_disabled(model: Any):
-    wrappers = [module for module in model.modules() if hasattr(module, "lora_A") and hasattr(module, "enabled")]
-    previous = [bool(module.enabled) for module in wrappers]
-    try:
-        for module in wrappers:
-            module.enabled = False
-        yield
-    finally:
-        for module, enabled in zip(wrappers, previous):
-            module.enabled = enabled
-
-
 def _first_parameter_device(model: Any, requested_device: str, torch: Any) -> Any:
     try:
         return next(model.parameters()).device
@@ -1874,12 +1685,6 @@ def _planned_steps(config: LoraTrainerConfig, example_count: int) -> int:
     return max(1, math.ceil(batches * max(0.0, config.train_epochs)))
 
 
-def _task_for_step(step: int, available_tasks: list[str]) -> str:
-    if not available_tasks:
-        raise ValueError("No training tasks available")
-    return available_tasks[step % len(available_tasks)]
-
-
 def _sft_batch_for_step(
     examples: list[dict[str, list[int]]],
     step: int,
@@ -1891,52 +1696,6 @@ def _sft_batch_for_step(
 ) -> dict[str, Any]:
     selected = _select_examples(examples, step, accum_index, batch_size)
     return _collate_token_examples(selected, pad_token_id, torch, device)
-
-
-def _dpo_batch_for_step(
-    examples: list[dict[str, dict[str, list[int]]]],
-    step: int,
-    accum_index: int,
-    batch_size: int,
-    pad_token_id: int,
-    torch: Any,
-    device: Any,
-) -> dict[str, Any]:
-    selected = _select_examples(examples, step, accum_index, batch_size)
-    return {
-        "chosen": _collate_token_examples(
-            [item["chosen"] for item in selected], pad_token_id, torch, device
-        ),
-        "rejected": _collate_token_examples(
-            [item["rejected"] for item in selected], pad_token_id, torch, device
-        ),
-    }
-
-
-def _kto_batch_for_step(
-    examples: list[dict[str, Any]],
-    step: int,
-    accum_index: int,
-    batch_size: int,
-    pad_token_id: int,
-    torch: Any,
-    device: Any,
-) -> dict[str, Any]:
-    selected = _select_examples(examples, step, accum_index, batch_size)
-    batch: dict[str, Any] = {
-        "target": _collate_token_examples(
-            [item["target"] for item in selected], pad_token_id, torch, device
-        ),
-        "desirable": torch.tensor(
-            [bool(item["desirable"]) for item in selected],
-            dtype=torch.bool,
-            device=device,
-        ),
-    }
-    kl_items = [item["kl"] for item in selected if item.get("kl") is not None]
-    if kl_items:
-        batch["kl"] = _collate_token_examples(kl_items, pad_token_id, torch, device)
-    return batch
 
 
 def _select_examples(
@@ -1990,220 +1749,11 @@ def _sft_loss(
     ).mean()
 
 
-def _dpo_loss(
-    model: Any,
-    batch: dict[str, Any],
-    *,
-    beta: float,
-    loss_vocab_sample_size: int = 0,
-    torch: Any,
-    F: Any,
-) -> Any:
-    chosen = batch["chosen"]
-    rejected = batch["rejected"]
-    if loss_vocab_sample_size > 0 and _trainable_parameters_are_output_head_only(model):
-        shared_hidden_loss = _dpo_loss_with_shared_hidden(
-            model,
-            chosen,
-            rejected,
-            beta=beta,
-            loss_vocab_sample_size=loss_vocab_sample_size,
-            torch=torch,
-            F=F,
-        )
-        if shared_hidden_loss is not None:
-            return shared_hidden_loss
-    policy_chosen = _sequence_logprob(
-        model,
-        chosen,
-        loss_vocab_sample_size=loss_vocab_sample_size,
-        average=False,
-        torch=torch,
-        F=F,
-    )
-    policy_rejected = _sequence_logprob(
-        model,
-        rejected,
-        loss_vocab_sample_size=loss_vocab_sample_size,
-        average=False,
-        torch=torch,
-        F=F,
-    )
-    with torch.no_grad(), _lora_disabled(model):
-        ref_chosen = _sequence_logprob(
-            model,
-            chosen,
-            loss_vocab_sample_size=loss_vocab_sample_size,
-            average=False,
-            torch=torch,
-            F=F,
-        )
-        ref_rejected = _sequence_logprob(
-            model,
-            rejected,
-            loss_vocab_sample_size=loss_vocab_sample_size,
-            average=False,
-            torch=torch,
-            F=F,
-        )
-    logits = beta * ((policy_chosen - policy_rejected) - (ref_chosen - ref_rejected))
-    logits = _zero_nonfinite(logits.float(), torch=torch)
-    return -F.logsigmoid(logits).mean()
-
-
-def _dpo_loss_with_shared_hidden(
-    model: Any,
-    chosen: dict[str, Any],
-    rejected: dict[str, Any],
-    *,
-    beta: float,
-    loss_vocab_sample_size: int,
-    torch: Any,
-    F: Any,
-) -> Any | None:
-    chosen_hidden = _causal_lm_hidden_states(model, chosen)
-    rejected_hidden = _causal_lm_hidden_states(model, rejected)
-    if chosen_hidden is None or rejected_hidden is None:
-        return None
-    policy_chosen_nll = _sampled_completion_nll_from_hidden(
-        model,
-        chosen,
-        chosen_hidden,
-        sample_size=loss_vocab_sample_size,
-        average=False,
-        torch=torch,
-        F=F,
-    )
-    policy_rejected_nll = _sampled_completion_nll_from_hidden(
-        model,
-        rejected,
-        rejected_hidden,
-        sample_size=loss_vocab_sample_size,
-        average=False,
-        torch=torch,
-        F=F,
-    )
-    if policy_chosen_nll is None or policy_rejected_nll is None:
-        return None
-    with torch.no_grad(), _lora_disabled(model):
-        ref_chosen_nll = _sampled_completion_nll_from_hidden(
-            model,
-            chosen,
-            chosen_hidden.detach(),
-            sample_size=loss_vocab_sample_size,
-            average=False,
-            torch=torch,
-            F=F,
-        )
-        ref_rejected_nll = _sampled_completion_nll_from_hidden(
-            model,
-            rejected,
-            rejected_hidden.detach(),
-            sample_size=loss_vocab_sample_size,
-            average=False,
-            torch=torch,
-            F=F,
-        )
-    if ref_chosen_nll is None or ref_rejected_nll is None:
-        return None
-    policy_chosen = -policy_chosen_nll
-    policy_rejected = -policy_rejected_nll
-    ref_chosen = -ref_chosen_nll
-    ref_rejected = -ref_rejected_nll
-    logits = beta * ((policy_chosen - policy_rejected) - (ref_chosen - ref_rejected))
-    logits = _zero_nonfinite(logits.float(), torch=torch)
-    return -F.logsigmoid(logits).mean()
-
-
-def _kto_loss(
-    model: Any,
-    batch: dict[str, Any],
-    *,
-    beta: float,
-    desirable_weight: float,
-    undesirable_weight: float,
-    loss_vocab_sample_size: int = 0,
-    torch: Any,
-    F: Any,
-) -> Any:
-    target = batch["target"]
-    policy_logps = _sequence_logprob(
-        model,
-        target,
-        loss_vocab_sample_size=loss_vocab_sample_size,
-        average=False,
-        torch=torch,
-        F=F,
-    )
-    with torch.no_grad(), _lora_disabled(model):
-        ref_logps = _sequence_logprob(
-            model,
-            target,
-            loss_vocab_sample_size=loss_vocab_sample_size,
-            average=False,
-            torch=torch,
-            F=F,
-        )
-    kl_batch = batch.get("kl")
-    if kl_batch is not None:
-        with torch.no_grad():
-            policy_kl = _sequence_logprob(
-                model,
-                kl_batch,
-                loss_vocab_sample_size=loss_vocab_sample_size,
-                average=False,
-                torch=torch,
-                F=F,
-            )
-            with _lora_disabled(model):
-                ref_kl = _sequence_logprob(
-                    model,
-                    kl_batch,
-                    loss_vocab_sample_size=loss_vocab_sample_size,
-                    average=False,
-                    torch=torch,
-                    F=F,
-                )
-        kl = (policy_kl - ref_kl).float().mean().clamp(min=0.0)
-    else:
-        kl = policy_logps.detach().new_zeros(())
-    logratio = _zero_nonfinite((policy_logps - ref_logps).float(), torch=torch)
-    desirable = batch["desirable"].to(logratio.device)
-    desirable_losses = float(desirable_weight) * (
-        1.0 - torch.sigmoid(beta * (logratio - kl))
-    )
-    undesirable_losses = float(undesirable_weight) * (
-        1.0 - torch.sigmoid(beta * (kl - logratio))
-    )
-    losses = torch.where(desirable, desirable_losses, undesirable_losses)
-    return losses.mean()
-
-
-def _sequence_logprob(
-    model: Any,
-    batch: dict[str, Any],
-    *,
-    loss_vocab_sample_size: int = 0,
-    average: bool = True,
-    torch: Any,
-    F: Any,
-) -> Any:
-    return -_sequence_nll(
-        model,
-        batch,
-        loss_vocab_sample_size=loss_vocab_sample_size,
-        average=average,
-        torch=torch,
-        F=F,
-    )
-
-
 def _sequence_nll(
     model: Any,
     batch: dict[str, Any],
     *,
     loss_vocab_sample_size: int = 0,
-    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any:
@@ -2212,7 +1762,6 @@ def _sequence_nll(
             model,
             batch,
             sample_size=loss_vocab_sample_size,
-            average=average,
             torch=torch,
             F=F,
         )
@@ -2223,9 +1772,7 @@ def _sequence_nll(
         attention_mask=batch["attention_mask"],
         use_cache=False,
     )
-    return _completion_nll(
-        outputs.logits, batch["labels"], average=average, torch=torch, F=F
-    )
+    return _completion_nll(outputs.logits, batch["labels"], torch=torch, F=F)
 
 
 def _sampled_completion_nll(
@@ -2233,32 +1780,10 @@ def _sampled_completion_nll(
     batch: dict[str, Any],
     *,
     sample_size: int,
-    average: bool = True,
     torch: Any,
     F: Any,
 ) -> Any | None:
     hidden = _causal_lm_hidden_states(model, batch)
-    return _sampled_completion_nll_from_hidden(
-        model,
-        batch,
-        hidden,
-        sample_size=sample_size,
-        average=average,
-        torch=torch,
-        F=F,
-    )
-
-
-def _sampled_completion_nll_from_hidden(
-    model: Any,
-    batch: dict[str, Any],
-    hidden: Any,
-    *,
-    sample_size: int,
-    average: bool = True,
-    torch: Any,
-    F: Any,
-) -> Any | None:
     if hidden is None or getattr(hidden, "ndim", 0) != 3:
         return None
     labels = batch["labels"].to(hidden.device)
@@ -2292,8 +1817,6 @@ def _sampled_completion_nll_from_hidden(
     ).squeeze(-1)
     token_nll = valid_logits.new_zeros(mask.shape)
     token_nll[mask] = token_nll_values
-    if not average:
-        return token_nll.sum(dim=1)
     denom = mask.sum(dim=1).clamp_min(1).to(token_nll.dtype)
     return token_nll.sum(dim=1) / denom
 
@@ -2379,25 +1902,6 @@ def _sanitize_nonfinite_optimizer_state(optimizer: Any, torch: Any) -> int:
                 value.copy_(torch.where(finite, value, torch.zeros_like(value)))
             sanitized += 1
     return sanitized
-
-
-def _trainable_parameters_are_output_head_only(model: Any) -> bool:
-    head_names = {"lm_head", "embed_out", "output", "score"}
-    try:
-        trainable_names = [
-            name
-            for name, parameter in model.named_parameters()
-            if getattr(parameter, "requires_grad", False)
-        ]
-    except Exception:
-        return False
-    if not trainable_names:
-        return False
-    for name in trainable_names:
-        parts = set(name.split("."))
-        if not parts.intersection(head_names):
-            return False
-    return True
 
 
 def _lora_targets_need_backbone_grad_checkpointing(target_modules: Iterable[str]) -> bool:
@@ -2517,9 +2021,7 @@ def _selected_linear_logits(
     return output.reshape(*input.shape[:-1], output.shape[-1])
 
 
-def _completion_nll(
-    logits: Any, labels: Any, *, average: bool = True, torch: Any, F: Any
-) -> Any:
+def _completion_nll(logits: Any, labels: Any, *, torch: Any, F: Any) -> Any:
     labels = labels.to(logits.device)
     shift_logits = logits[:, :-1, :].float()
     shift_labels = labels[:, 1:]
@@ -2528,8 +2030,6 @@ def _completion_nll(
     log_probs = F.log_softmax(shift_logits, dim=-1)
     token_log_probs = log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
     token_nll = -token_log_probs * mask.to(token_log_probs.dtype)
-    if not average:
-        return token_nll.sum(dim=1)
     return token_nll.sum(dim=1) / mask.sum(dim=1).clamp_min(1).to(token_nll.dtype)
 
 
@@ -2785,6 +2285,33 @@ def _stop_requested(stop_file: Path | None) -> bool:
     return stop_file.exists()
 
 
+def _pause_requested(pause_file: Path | None) -> bool:
+    if pause_file is None:
+        return False
+    return pause_file.exists()
+
+
+def _wait_while_paused(config: LoraTrainerConfig, *, primary: bool) -> float:
+    """Block while the supervisor's pause file exists (inference is busy).
+
+    Returns the seconds spent waiting. A stop request or termination signal
+    breaks the wait so shutdown is never held up by a busy server.
+    """
+    if not _pause_requested(config.pause_file):
+        return 0.0
+    started = time.monotonic()
+    if primary:
+        logger.info("LoRA trainer paused: inference is busy")
+    while _pause_requested(config.pause_file):
+        if _TERMINATION_REQUESTED or _stop_requested(config.stop_file):
+            break
+        time.sleep(0.5)
+    waited = time.monotonic() - started
+    if primary:
+        logger.info("LoRA trainer resuming after %.1fs pause", waited)
+    return waited
+
+
 def _write_metric(config: LoraTrainerConfig, payload: dict[str, Any]) -> None:
     if config.metrics_path is None:
         return
@@ -2847,7 +2374,7 @@ def _split_csv(value: str | None) -> tuple[str, ...]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Raw torch SFT/DPO/KTO LoRA trainer")
+    parser = argparse.ArgumentParser(description="Raw torch SFT LoRA trainer")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--checkpoint-dir", required=True)
@@ -2857,14 +2384,6 @@ def parse_args() -> argparse.Namespace:
             "VLLM_COLOCATE_LORA_ADAPTER_NAME",
             default="colocate-lora",
         ),
-    )
-    parser.add_argument(
-        "--task-mix",
-        default=_env_first(
-            "VLLM_COLOCATE_TRAIN_TASK_MIX",
-            default="mixed",
-        ),
-        choices=("mixed", "sft", "dpo", "kto"),
     )
     parser.add_argument(
         "--device",
@@ -2958,46 +2477,6 @@ def parse_args() -> argparse.Namespace:
             _env_first(
                 "VLLM_COLOCATE_MAX_GRAD_NORM",
                 default="1",
-            )
-        ),
-    )
-    parser.add_argument(
-        "--dpo-beta",
-        type=float,
-        default=float(
-            _env_first(
-                "VLLM_COLOCATE_DPO_BETA",
-                default="0.1",
-            )
-        ),
-    )
-    parser.add_argument(
-        "--kto-beta",
-        type=float,
-        default=float(
-            _env_first(
-                "VLLM_COLOCATE_KTO_BETA",
-                default="0.1",
-            )
-        ),
-    )
-    parser.add_argument(
-        "--kto-desirable-weight",
-        type=float,
-        default=float(
-            _env_first(
-                "VLLM_COLOCATE_KTO_DESIRABLE_WEIGHT",
-                default="1.0",
-            )
-        ),
-    )
-    parser.add_argument(
-        "--kto-undesirable-weight",
-        type=float,
-        default=float(
-            _env_first(
-                "VLLM_COLOCATE_KTO_UNDESIRABLE_WEIGHT",
-                default="1.0",
             )
         ),
     )
@@ -3113,6 +2592,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--stop-file", default=_env_first("VLLM_COLOCATE_STOP_FILE"))
+    parser.add_argument("--pause-file", default=_env_first("VLLM_COLOCATE_PAUSE_FILE"))
     parser.add_argument("--metrics-path", default=_env_first("VLLM_COLOCATE_METRICS_PATH"))
     parser.add_argument(
         "--run-id",
@@ -3142,7 +2622,6 @@ def main() -> int:
             data_path=Path(args.data_path),
             checkpoint_dir=Path(args.checkpoint_dir).resolve(),
             adapter_name=args.adapter_name,
-            task_mix=args.task_mix,
             device=args.device,
             parallel_mode=args.parallel_mode,
             max_steps=args.max_steps,
@@ -3153,10 +2632,6 @@ def main() -> int:
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             max_grad_norm=args.max_grad_norm,
-            dpo_beta=args.dpo_beta,
-            kto_beta=args.kto_beta,
-            kto_desirable_weight=args.kto_desirable_weight,
-            kto_undesirable_weight=args.kto_undesirable_weight,
             loss_vocab_sample_size=args.loss_vocab_sample_size,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -3170,6 +2645,7 @@ def main() -> int:
             checkpoint_every=args.checkpoint_every,
             keep_last_checkpoints=args.keep_last_checkpoints,
             stop_file=Path(args.stop_file) if args.stop_file else None,
+            pause_file=Path(args.pause_file) if args.pause_file else None,
             metrics_path=Path(args.metrics_path) if args.metrics_path else None,
             run_id=args.run_id,
             log_every=args.log_every,

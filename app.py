@@ -1,46 +1,52 @@
-"""Colocated vLLM inference and LoRA training supervisor.
+"""vLLM-native SFT: one server, one port, one training route.
 
-One container, two GPU halves:
+This launcher runs vLLM's stock OpenAI-compatible server in-process and
+attaches a single extra route to the same app on the same port:
 
-- vLLM serves the base model directly on the public inference port using one
-  half of the visible GPUs, started with ``--enable-lora`` and runtime LoRA
-  updating so adapters can be swapped without a restart.
-- A FastAPI control plane on a second port accepts SFT/DPO/KTO training jobs
-  whose samples are provided in the request body. Jobs run sequentially in a
-  trainer subprocess pinned to the other half of the GPUs.
-- After each training job the exported PEFT adapter is loaded into the running
-  vLLM server via ``/v1/load_lora_adapter`` (fast weight sync). Clients reach
-  the tuned weights by requesting the adapter model name.
+- ``POST /train/sft`` accepts SFT samples in the request body and queues a
+  LoRA training job. ``GET /train/sft`` reports training state.
+- All visible GPUs serve inference at all times; the trainer subprocess sees
+  the same GPUs and coexists in the memory headroom left by
+  ``--gpu-memory-utilization`` (default lowered to leave room for training).
+- Training steps only run while inference is idle: an in-flight request
+  counter on the vLLM app toggles a pause file that the trainer polls
+  between steps, so inference always has the GPUs when requests arrive.
+- The base model (quantized checkpoints included) stays loaded in vLLM the
+  whole time. After each job the exported PEFT adapter is hot-swapped via
+  ``/v1/load_lora_adapter`` — vLLM applies it on top of the resident base
+  weights, so there is never a base-weight reload.
 """
 
 from __future__ import annotations
+
+import os
+
+# Old vLLM versions register the runtime-LoRA routes at import time of the
+# api_server module, and newer ones may cache env lookups — this must be set
+# before anything imports vllm.
+os.environ.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
 
 import asyncio
 import contextlib
 import hashlib
 import json
 import logging
-import math
-import os
 import re
 import shlex
 import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import httpx
-import uvicorn
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 logger = logging.getLogger("vllm_colocate.app")
 
 TRAINER_SCRIPT = Path(__file__).with_name("lora_trainer.py")
-SUPERVISOR_ENV_PREFIX = "VLLM_COLOCATE_"
-TRAIN_KINDS = ("sft", "dpo", "kto")
 # vLLM's LoRAConfig only accepts these --max-lora-rank values.
 VLLM_ALLOWED_MAX_LORA_RANKS = (8, 16, 32, 64, 128, 256, 320, 512)
 JOB_OPTION_FIELDS: dict[str, type] = {
@@ -52,10 +58,6 @@ JOB_OPTION_FIELDS: dict[str, type] = {
     "learning_rate": float,
     "weight_decay": float,
     "max_grad_norm": float,
-    "dpo_beta": float,
-    "kto_beta": float,
-    "kto_desirable_weight": float,
-    "kto_undesirable_weight": float,
     "loss_vocab_sample_size": int,
 }
 
@@ -124,14 +126,6 @@ def _split_csv(value: str | None) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(",") if part.strip())
 
 
-def _extra_arg_present(extra_args: str, option: str) -> bool:
-    try:
-        parts = shlex.split(extra_args or "")
-    except ValueError:
-        return False
-    return option in parts or any(part.startswith(f"{option}=") for part in parts)
-
-
 def _detect_gpu_ids() -> tuple[str, ...]:
     raw = os.getenv("CUDA_VISIBLE_DEVICES")
     if raw is not None:
@@ -162,65 +156,19 @@ def _detect_gpu_ids() -> tuple[str, ...]:
     return tuple(str(index) for index in range(count))
 
 
-def _partition_gpus() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Split visible GPUs between inference and training.
-
-    Returns ``(all_gpus, inference_gpus, training_gpus)``. Explicit
-    ``VLLM_COLOCATE_INFERENCE_GPUS`` / ``VLLM_COLOCATE_TRAINING_GPUS`` lists
-    win; otherwise inference gets the first half (rounded up) and training the
-    rest. A single-GPU host shares the one device between both roles.
-    """
-    detected = _detect_gpu_ids()
-    inference = _split_csv(os.getenv("VLLM_COLOCATE_INFERENCE_GPUS"))
-    training = _split_csv(os.getenv("VLLM_COLOCATE_TRAINING_GPUS"))
-    if detected:
-        for name, override in (
-            ("VLLM_COLOCATE_INFERENCE_GPUS", inference),
-            ("VLLM_COLOCATE_TRAINING_GPUS", training),
-        ):
-            unknown = [gpu for gpu in override if gpu not in detected]
-            if unknown:
-                raise RuntimeError(
-                    f"{name} entries {unknown!r} are not among the detected GPU "
-                    f"ids {list(detected)!r}; use the same identifiers (indices "
-                    "from nvidia-smi, or the tokens in this process's "
-                    "CUDA_VISIBLE_DEVICES)."
-                )
-    if inference and training:
-        all_gpus = detected or tuple(dict.fromkeys(inference + training))
-        return all_gpus, inference, training
-    if inference:
-        all_gpus = detected or inference
-        remaining = tuple(g for g in all_gpus if g not in inference)
-        return all_gpus, inference, remaining or inference
-    if training:
-        all_gpus = detected or training
-        remaining = tuple(g for g in all_gpus if g not in training)
-        return all_gpus, remaining or training, training
-    if not detected:
-        return (), (), ()
-    if len(detected) == 1:
-        return detected, detected, detected
-    split = math.ceil(len(detected) / 2)
-    return detected, detected[:split], detected[split:]
-
-
 @dataclass(frozen=True)
 class Settings:
     model_name: str
     served_model_name: str
     adapter_name: str
-    inference_host: str
-    inference_port: int
-    api_host: str
-    api_port: int
+    host: str
+    port: int
     data_dir: Path
     checkpoint_dir: Path
     jobs_dir: Path
     metrics_path: Path
-    all_gpus: tuple[str, ...]
-    inference_gpus: tuple[str, ...]
-    training_gpus: tuple[str, ...]
+    pause_file: Path
+    gpus: tuple[str, ...]
     gpu_memory_utilization: float
     tensor_parallel_size: int
     max_model_len: int | None
@@ -230,17 +178,13 @@ class Settings:
     trust_remote_code: bool
     vllm_extra_args: str
     ready_timeout_seconds: float
-    cancel_grace_seconds: float
+    idle_grace_seconds: float
     sync_on_startup: bool
 
     @property
-    def inference_base_url(self) -> str:
-        host = self.inference_host if self.inference_host != "0.0.0.0" else "127.0.0.1"
-        return f"http://{host}:{self.inference_port}"
-
-    @property
-    def gpus_shared(self) -> bool:
-        return bool(self.inference_gpus) and self.inference_gpus == self.training_gpus
+    def base_url(self) -> str:
+        host = self.host if self.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+        return f"http://{host}:{self.port}"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -259,19 +203,16 @@ class Settings:
                 str(data_dir / "checkpoints" / _safe_slug(model_name)),
             )
         ).resolve()
-        all_gpus, inference_gpus, training_gpus = _partition_gpus()
-        gpus_shared = bool(inference_gpus) and inference_gpus == training_gpus
         lora_r = _env_int("VLLM_COLOCATE_LORA_R", 16)
+        gpus = _detect_gpu_ids()
         return cls(
             model_name=model_name,
             served_model_name=served_model_name,
             adapter_name=_env_str(
                 "VLLM_COLOCATE_LORA_ADAPTER_NAME", f"{served_model_name}-lora"
             ),
-            inference_host=_env_str("VLLM_COLOCATE_INFERENCE_HOST", "0.0.0.0"),
-            inference_port=_env_int("VLLM_COLOCATE_INFERENCE_PORT", 8000),
-            api_host=_env_str("VLLM_COLOCATE_API_HOST", "0.0.0.0"),
-            api_port=_env_int("VLLM_COLOCATE_API_PORT", 8001),
+            host=_env_str("VLLM_COLOCATE_HOST", "0.0.0.0"),
+            port=_env_int("VLLM_COLOCATE_PORT", 8000),
             data_dir=data_dir,
             checkpoint_dir=checkpoint_dir,
             jobs_dir=Path(
@@ -283,16 +224,20 @@ class Settings:
                     str(data_dir / "trainer_metrics.jsonl"),
                 )
             ).resolve(),
-            all_gpus=all_gpus,
-            inference_gpus=inference_gpus,
-            training_gpus=training_gpus,
+            pause_file=Path(
+                _env_str(
+                    "VLLM_COLOCATE_PAUSE_FILE", str(data_dir / "trainer.pause")
+                )
+            ).resolve(),
+            gpus=gpus,
+            # Inference and training share every GPU, so vLLM must leave
+            # memory headroom for the trainer subprocess.
             gpu_memory_utilization=_env_float(
-                "VLLM_COLOCATE_GPU_MEMORY_UTILIZATION",
-                0.45 if gpus_shared else 0.90,
+                "VLLM_COLOCATE_GPU_MEMORY_UTILIZATION", 0.45
             ),
             tensor_parallel_size=_env_int(
                 "VLLM_COLOCATE_TENSOR_PARALLEL_SIZE",
-                _default_tensor_parallel_size(len(inference_gpus)),
+                _default_tensor_parallel_size(len(gpus)),
             ),
             max_model_len=_env_optional_int("VLLM_COLOCATE_MAX_MODEL_LEN", None),
             max_num_seqs=_env_optional_int("VLLM_COLOCATE_MAX_NUM_SEQS", None),
@@ -306,191 +251,72 @@ class Settings:
             ready_timeout_seconds=_env_float(
                 "VLLM_COLOCATE_READY_TIMEOUT_SECONDS", 1800.0
             ),
-            cancel_grace_seconds=_env_float(
-                "VLLM_COLOCATE_CANCEL_GRACE_SECONDS", 30.0
+            idle_grace_seconds=_env_float(
+                "VLLM_COLOCATE_IDLE_GRACE_SECONDS", 5.0
             ),
             sync_on_startup=_env_bool("VLLM_COLOCATE_SYNC_ON_STARTUP", True),
         )
 
 
-class VllmProcess:
-    """Launches and talks to the vLLM OpenAI server on the inference GPUs."""
+# --------------------------------------------------------------------- gate
 
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.process: subprocess.Popen[Any] | None = None
-        self.ready = False
+_GATE_EXCLUDED_PATHS = frozenset(
+    {"/v1/load_lora_adapter", "/v1/unload_lora_adapter"}
+)
+_GATE_IDLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
-    def status(self) -> dict[str, Any]:
-        process = self.process
-        return {
-            "running": process is not None and process.poll() is None,
-            "ready": self.ready,
-            "pid": process.pid if process is not None else None,
-            "returncode": process.returncode if process is not None else None,
-            "base_url": self.settings.inference_base_url,
-        }
 
-    def start(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            return
-        self.ready = False
-        self.settings.data_dir.mkdir(parents=True, exist_ok=True)
-        cmd = self._command()
-        env = self._child_env()
-        logger.info(
-            "Starting vLLM on GPUs [%s]: %s",
-            ",".join(self.settings.inference_gpus) or "-",
-            shlex.join(cmd),
-        )
-        self.process = subprocess.Popen(cmd, env=env)
+class InFlightGate:
+    """Pure-ASGI middleware counting in-flight inference requests.
 
-    def terminate(self) -> None:
-        process = self.process
-        if process is None or process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
+    Installed through vLLM's own ``--middleware`` mechanism, so it wraps the
+    stock app without patching it. State is class-level: the training gate
+    reads it to decide when the trainer may run.
+    """
 
-    def _child_env(self) -> dict[str, str]:
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith(SUPERVISOR_ENV_PREFIX)
-        }
-        env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
-        env.setdefault("PYTHONUNBUFFERED", "1")
-        if self.settings.inference_gpus:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(self.settings.inference_gpus)
-        return env
+    in_flight = 0
+    last_activity = 0.0  # monotonic; 0.0 = no inference request seen yet
 
-    def _command(self) -> list[str]:
-        settings = self.settings
-        cmd = [
-            "vllm",
-            "serve",
-            settings.model_name,
-            "--served-model-name",
-            settings.served_model_name,
-            "--host",
-            settings.inference_host,
-            "--port",
-            str(settings.inference_port),
-            "--gpu-memory-utilization",
-            str(settings.gpu_memory_utilization),
-        ]
-        extra_args = settings.vllm_extra_args
-        if not _extra_arg_present(extra_args, "--enable-lora"):
-            cmd.append("--enable-lora")
-        if not _extra_arg_present(extra_args, "--max-loras"):
-            cmd.extend(["--max-loras", str(settings.max_loras)])
-        if not _extra_arg_present(extra_args, "--max-lora-rank"):
-            cmd.extend(["--max-lora-rank", str(settings.max_lora_rank)])
-        if settings.tensor_parallel_size > 1 and not _extra_arg_present(
-            extra_args, "--tensor-parallel-size"
-        ):
-            cmd.extend(
-                ["--tensor-parallel-size", str(settings.tensor_parallel_size)]
-            )
-        if settings.trust_remote_code:
-            cmd.append("--trust-remote-code")
-        if settings.max_model_len:
-            cmd.extend(["--max-model-len", str(settings.max_model_len)])
-        if settings.max_num_seqs:
-            cmd.extend(["--max-num-seqs", str(settings.max_num_seqs)])
-        if extra_args:
-            cmd.extend(shlex.split(extra_args))
-        return cmd
+    def __init__(self, app: Any):
+        self.app = app
 
-    async def wait_ready(self, timeout_seconds: float | None = None) -> None:
-        if timeout_seconds is None:
-            timeout_seconds = self.settings.ready_timeout_seconds
-        deadline = time.monotonic() + max(0.0, timeout_seconds)
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            while time.monotonic() < deadline:
-                if self.process is not None and self.process.poll() is not None:
-                    raise RuntimeError(
-                        f"vLLM exited with code {self.process.returncode}"
-                    )
-                try:
-                    response = await client.get(
-                        f"{self.settings.inference_base_url}/v1/models"
-                    )
-                    if response.status_code < 500:
-                        self.ready = True
-                        return
-                except httpx.HTTPError:
-                    pass
-                await asyncio.sleep(2)
-        raise TimeoutError("Timed out waiting for vLLM to become ready")
-
-    async def is_ready(self) -> bool:
-        if self.process is None or self.process.poll() is not None:
+    @staticmethod
+    def _counts(scope: dict[str, Any]) -> bool:
+        if scope.get("method", "GET").upper() in _GATE_IDLE_METHODS:
             return False
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(
-                    f"{self.settings.inference_base_url}/v1/models"
-                )
-                return response.status_code < 500
-        except httpx.HTTPError:
+        path = scope.get("path", "")
+        if path in _GATE_EXCLUDED_PATHS or path.startswith("/train"):
             return False
+        return True
 
-    async def load_lora_adapter(
-        self, *, adapter_name: str, adapter_path: Path
-    ) -> tuple[bool, str | None]:
-        payload = {"lora_name": adapter_name, "lora_path": str(adapter_path)}
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            try:
-                await client.post(
-                    f"{self.settings.inference_base_url}/v1/unload_lora_adapter",
-                    json={"lora_name": adapter_name},
-                )
-            except httpx.HTTPError:
-                pass
-            try:
-                response = await client.post(
-                    f"{self.settings.inference_base_url}/v1/load_lora_adapter",
-                    json=payload,
-                )
-            except httpx.HTTPError as exc:
-                return False, f"load_lora_adapter request failed: {exc}"
-        if response.status_code < 400:
-            return True, None
-        return (
-            False,
-            f"vLLM rejected adapter load status={response.status_code} "
-            f"body={response.text[:500]}",
-        )
-
-    async def loaded_models(self) -> list[str]:
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or not self._counts(scope):
+            await self.app(scope, receive, send)
+            return
+        cls = InFlightGate
+        cls.in_flight += 1
+        cls.last_activity = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(
-                    f"{self.settings.inference_base_url}/v1/models"
-                )
-                if response.status_code >= 400:
-                    return []
-                payload = response.json()
-        except (httpx.HTTPError, ValueError):
-            return []
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, list):
-            return []
-        return [
-            str(item.get("id"))
-            for item in data
-            if isinstance(item, dict) and item.get("id")
-        ]
+            await self.app(scope, receive, send)
+        finally:
+            cls.in_flight -= 1
+            cls.last_activity = time.monotonic()
+
+    @classmethod
+    def busy(cls, idle_grace_seconds: float) -> bool:
+        if cls.in_flight > 0:
+            return True
+        if cls.last_activity == 0.0:
+            return False
+        return (time.monotonic() - cls.last_activity) < idle_grace_seconds
+
+
+# ---------------------------------------------------------------- training
 
 
 @dataclass
 class TrainingJob:
     id: str
-    kind: str
     sample_count: int
     data_path: Path
     stop_file: Path
@@ -501,7 +327,6 @@ class TrainingJob:
     finished_at: float | None = None
     returncode: int | None = None
     error: str | None = None
-    cancel_requested: bool = False
     step_before: int | None = None
     step_after: int | None = None
     sync: dict[str, Any] | None = None
@@ -510,7 +335,6 @@ class TrainingJob:
     def payload(self) -> dict[str, Any]:
         return {
             "id": self.id,
-            "kind": self.kind,
             "status": self.status,
             "sample_count": self.sample_count,
             "created_at": self.created_at,
@@ -518,7 +342,6 @@ class TrainingJob:
             "finished_at": self.finished_at,
             "returncode": self.returncode,
             "error": self.error,
-            "cancel_requested": self.cancel_requested,
             "step_before": self.step_before,
             "step_after": self.step_after,
             "sync": self.sync,
@@ -527,7 +350,7 @@ class TrainingJob:
         }
 
 
-def _validate_sample(kind: str, sample: Any) -> str | None:
+def _validate_sample(sample: Any) -> str | None:
     if not isinstance(sample, dict):
         return "sample must be a JSON object"
     messages = sample.get("messages")
@@ -536,29 +359,11 @@ def _validate_sample(kind: str, sample: Any) -> str | None:
         or not all(isinstance(message, dict) for message in messages)
     ):
         return "messages must be a list of objects"
-    has_prompt = bool(sample.get("prompt")) or bool(sample.get("messages"))
-    if kind == "sft":
-        if sample.get("messages") or sample.get("text"):
-            return None
-        if sample.get("prompt") is not None and sample.get("completion") is not None:
-            return None
-        return "sft sample needs messages, text, or prompt+completion"
-    if kind == "dpo":
-        if not has_prompt:
-            return "dpo sample needs prompt or messages"
-        if not sample.get("chosen") or not sample.get("rejected"):
-            return "dpo sample needs chosen and rejected"
+    if sample.get("messages") or sample.get("text"):
         return None
-    if kind == "kto":
-        if not has_prompt:
-            return "kto sample needs prompt or messages"
-        if not sample.get("completion"):
-            return "kto sample needs completion"
-        label = sample.get("label", sample.get("desirable"))
-        if not isinstance(label, bool):
-            return "kto sample needs boolean label (or desirable)"
+    if sample.get("prompt") is not None and sample.get("completion") is not None:
         return None
-    return f"unknown task kind {kind!r}"
+    return "sft sample needs messages, text, or prompt+completion"
 
 
 def _extract_samples(payload: Any) -> list[Any]:
@@ -602,14 +407,14 @@ def _extract_options(payload: Any) -> dict[str, Any]:
     return options
 
 
-def _write_job_rows(data_path: Path, kind: str, samples: list[Any]) -> None:
+def _write_job_rows(data_path: Path, samples: list[Any]) -> None:
     data_path.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
     with data_path.open("w", encoding="utf-8") as handle:
         for sample in samples:
             row = {
                 **sample,
-                "task": kind,
+                "task": "sft",
                 "id": sample.get("id") or str(uuid.uuid4()),
                 "ts": now,
             }
@@ -658,37 +463,42 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 
 
 class TrainingManager:
-    """Serializes training jobs onto the training GPUs and syncs adapters."""
+    """Queues SFT jobs, runs the trainer while inference is idle, and
+    hot-swaps the exported adapter into the running vLLM server."""
 
-    def __init__(self, settings: Settings, vllm: VllmProcess):
+    def __init__(self, settings: Settings):
         self.settings = settings
-        self.vllm = vllm
         self.jobs: dict[str, TrainingJob] = {}
         self.job_order: list[str] = []
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self.worker_task: asyncio.Task[None] | None = None
+        self.gate_task: asyncio.Task[None] | None = None
         self.current_process: asyncio.subprocess.Process | None = None
         self.current_job_id: str | None = None
         self.sync_lock = asyncio.Lock()
         self.active_adapter_path = settings.checkpoint_dir / "active_adapter.json"
-        self._cancel_tasks: set[asyncio.Task[None]] = set()
+        self.trainer_paused: bool | None = None
 
     # ---------------------------------------------------------------- queue
 
     def start(self) -> None:
         if self.worker_task is None or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._worker())
+        if self.gate_task is None or self.gate_task.done():
+            self.gate_task = asyncio.create_task(self._gate_loop())
 
     async def stop(self) -> None:
         # Capture the in-flight process/job BEFORE cancelling the worker:
         # _run_job's finally block clears both while the cancellation unwinds.
         process = self.current_process
         job = self.jobs.get(self.current_job_id) if self.current_job_id else None
-        if self.worker_task is not None:
-            self.worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.worker_task
-            self.worker_task = None
+        for task in (self.worker_task, self.gate_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self.worker_task = None
+        self.gate_task = None
         if process is not None and process.returncode is None:
             process.terminate()
             with contextlib.suppress(asyncio.TimeoutError):
@@ -697,28 +507,29 @@ class TrainingManager:
                 process.kill()
         if job is not None and not job.done_event.is_set():
             job.status = "canceled"
-            job.error = "supervisor shutdown"
+            job.error = "server shutdown"
             job.finished_at = time.time()
             job.done_event.set()
+        with contextlib.suppress(OSError):
+            self.settings.pause_file.unlink(missing_ok=True)
 
     async def submit(
-        self, kind: str, samples: list[Any], options: dict[str, Any]
+        self, samples: list[Any], options: dict[str, Any]
     ) -> TrainingJob:
         errors = []
         for index, sample in enumerate(samples):
-            error = _validate_sample(kind, sample)
+            error = _validate_sample(sample)
             if error:
                 errors.append(f"sample[{index}]: {error}")
             if len(errors) >= 5:
                 break
         if errors:
             raise HTTPException(status_code=400, detail={"errors": errors})
-        job_id = f"{kind}-{uuid.uuid4().hex[:12]}"
+        job_id = f"sft-{uuid.uuid4().hex[:12]}"
         data_path = self.settings.jobs_dir / f"{job_id}.jsonl"
-        await asyncio.to_thread(_write_job_rows, data_path, kind, samples)
+        await asyncio.to_thread(_write_job_rows, data_path, samples)
         job = TrainingJob(
             id=job_id,
-            kind=kind,
             sample_count=len(samples),
             data_path=data_path,
             stop_file=self.settings.jobs_dir / f"{job_id}.stop",
@@ -727,51 +538,32 @@ class TrainingManager:
         self.jobs[job.id] = job
         self.job_order.append(job.id)
         self.queue.put_nowait(job.id)
-        logger.info(
-            "Queued %s training job %s with %d samples", kind, job.id, len(samples)
-        )
+        logger.info("Queued SFT job %s with %d samples", job.id, len(samples))
         return job
 
-    async def cancel(self, job_id: str) -> TrainingJob:
-        job = self.jobs.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="unknown job id")
-        if job.status in {"succeeded", "failed", "canceled"}:
-            return job
-        if job.returncode is not None:
-            # The trainer already exited; the job is only finishing its
-            # adapter sync. Too late to cancel.
-            return job
-        job.cancel_requested = True
-        if job.status == "queued":
-            job.status = "canceled"
-            job.finished_at = time.time()
-            job.done_event.set()
-            return job
-        try:
-            job.stop_file.parent.mkdir(parents=True, exist_ok=True)
-            job.stop_file.touch()
-        except OSError:
-            logger.warning("Could not write stop file for job %s", job_id)
-        task = asyncio.create_task(self._escalate_cancel(job))
-        self._cancel_tasks.add(task)
-        task.add_done_callback(self._cancel_tasks.discard)
-        return job
+    # ----------------------------------------------------------------- gate
 
-    async def _escalate_cancel(self, job: TrainingJob) -> None:
-        deadline = time.monotonic() + max(0.0, self.settings.cancel_grace_seconds)
-        while time.monotonic() < deadline:
-            if job.done_event.is_set():
-                return
-            await asyncio.sleep(1.0)
-        process = self.current_process
-        if self.current_job_id == job.id and process is not None:
-            if process.returncode is None:
-                logger.info("Terminating training job %s after cancel grace", job.id)
-                process.terminate()
-                await asyncio.sleep(5.0)
-                if process.returncode is None:
-                    process.kill()
+    async def _gate_loop(self) -> None:
+        """Mirror inference activity into the trainer pause file.
+
+        The trainer polls the file between steps: present = pause, absent =
+        train. Toggled only on transitions so the loop is one stat-free
+        comparison most of the time.
+        """
+        pause_file = self.settings.pause_file
+        while True:
+            busy = InFlightGate.busy(self.settings.idle_grace_seconds)
+            if busy != self.trainer_paused:
+                try:
+                    if busy:
+                        pause_file.parent.mkdir(parents=True, exist_ok=True)
+                        pause_file.touch()
+                    else:
+                        pause_file.unlink(missing_ok=True)
+                    self.trainer_paused = busy
+                except OSError:
+                    logger.warning("Could not update trainer pause file")
+            await asyncio.sleep(0.25)
 
     # --------------------------------------------------------------- worker
 
@@ -797,12 +589,7 @@ class TrainingManager:
         job.step_before = self.latest_checkpoint_step()
         cmd = self._trainer_command(job)
         env = self._trainer_env()
-        logger.info(
-            "Starting training job %s on GPUs [%s]: %s",
-            job.id,
-            ",".join(self.settings.training_gpus) or "-",
-            shlex.join(cmd),
-        )
+        logger.info("Starting training job %s: %s", job.id, shlex.join(cmd))
         try:
             process = await asyncio.create_subprocess_exec(*cmd, env=env)
         except OSError as exc:
@@ -827,9 +614,7 @@ class TrainingManager:
         )
         if checkpoint_advanced:
             job.sync = await self.sync_adapter()
-        if job.cancel_requested:
-            job.status = "canceled"
-        elif job.returncode == 0:
+        if job.returncode == 0:
             job.status = "succeeded"
         else:
             job.status = "failed"
@@ -870,26 +655,26 @@ class TrainingManager:
             str(settings.checkpoint_dir),
             "--adapter-name",
             settings.adapter_name,
-            "--task-mix",
-            job.kind,
             "--run-id",
             job.id,
             "--metrics-path",
             str(settings.metrics_path),
             "--stop-file",
             str(job.stop_file),
+            "--pause-file",
+            str(settings.pause_file),
         ]
         for key, value in job.options.items():
             cmd.extend([f"--{key.replace('_', '-')}", str(value)])
         return cmd
 
     def _trainer_env(self) -> dict[str, str]:
+        # The trainer shares every GPU with vLLM: no CUDA_VISIBLE_DEVICES
+        # override, just allocator settings that play nice with a neighbor.
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         env.setdefault("OMP_NUM_THREADS", "1")
-        if self.settings.training_gpus:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(self.settings.training_gpus)
         return env
 
     # ---------------------------------------------------------- adapter sync
@@ -917,15 +702,53 @@ class TrainingManager:
             return None
         return path
 
+    async def wait_server_ready(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while time.monotonic() < deadline:
+                try:
+                    response = await client.get(f"{self.settings.base_url}/health")
+                    if response.status_code == 200:
+                        return True
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(2)
+        return False
+
+    async def _load_lora_adapter(
+        self, *, adapter_name: str, adapter_path: Path
+    ) -> tuple[bool, str | None]:
+        payload = {"lora_name": adapter_name, "lora_path": str(adapter_path)}
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            # Unload-then-load works on every vLLM version; a missing name
+            # just 404s, which is fine.
+            try:
+                await client.post(
+                    f"{self.settings.base_url}/v1/unload_lora_adapter",
+                    json={"lora_name": adapter_name},
+                )
+            except httpx.HTTPError:
+                pass
+            try:
+                response = await client.post(
+                    f"{self.settings.base_url}/v1/load_lora_adapter",
+                    json=payload,
+                )
+            except httpx.HTTPError as exc:
+                return False, f"load_lora_adapter request failed: {exc}"
+        if response.status_code < 400:
+            return True, None
+        return (
+            False,
+            f"vLLM rejected adapter load status={response.status_code} "
+            f"body={response.text[:500]}",
+        )
+
     async def sync_adapter(self) -> dict[str, Any]:
         async with self.sync_lock:
             adapter_name = self.settings.adapter_name
-            # Bounded wait: if vLLM is still loading, the supervisor loop
-            # re-syncs the adapter as soon as it becomes ready.
-            try:
-                await self.vllm.wait_ready(timeout_seconds=300.0)
-            except (RuntimeError, TimeoutError) as exc:
-                return {"ok": False, "error": f"vLLM not ready: {exc}"}
+            if not await self.wait_server_ready(300.0):
+                return {"ok": False, "error": "vLLM server not ready"}
             # Resolve AFTER the wait so a checkpoint pruned or replaced in the
             # meantime cannot leave us loading a stale path.
             latest = self.latest_checkpoint()
@@ -935,7 +758,7 @@ class TrainingManager:
                     "ok": False,
                     "error": "no exported adapter found in latest.json",
                 }
-            ok, error = await self.vllm.load_lora_adapter(
+            ok, error = await self._load_lora_adapter(
                 adapter_name=adapter_name, adapter_path=adapter_path
             )
             result = {
@@ -958,7 +781,7 @@ class TrainingManager:
                     and previous_path != str(adapter_path)
                     and Path(previous_path).is_dir()
                 ):
-                    rolled_back, rollback_error = await self.vllm.load_lora_adapter(
+                    rolled_back, rollback_error = await self._load_lora_adapter(
                         adapter_name=adapter_name,
                         adapter_path=Path(previous_path),
                     )
@@ -1001,6 +824,7 @@ class TrainingManager:
     def status(self) -> dict[str, Any]:
         latest = self.latest_checkpoint()
         return {
+            "paused": bool(self.trainer_paused),
             "queued_jobs": sum(
                 1 for job in self.jobs.values() if job.status == "queued"
             ),
@@ -1015,102 +839,24 @@ class TrainingManager:
         }
 
 
+# ------------------------------------------------------------------- routes
+
 settings = Settings.from_env()
-vllm = VllmProcess(settings)
-manager = TrainingManager(settings, vllm)
+manager = TrainingManager(settings)
+train_router = APIRouter()
 
 
-async def _supervise_vllm() -> None:
-    """Keep vLLM alive; restore the last adapter after each (re)start."""
-    backoff = 5.0
-    while True:
-        process = vllm.process
-        if process is None or process.poll() is not None:
-            if process is not None:
-                logger.warning(
-                    "vLLM exited with code %s; restarting in %.0fs",
-                    process.returncode,
-                    backoff,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(300.0, backoff * 2)
-            try:
-                vllm.start()
-            except Exception:
-                logger.exception("Could not start vLLM")
-                await asyncio.sleep(backoff)
-                backoff = min(300.0, backoff * 2)
-                continue
-        if not vllm.ready:
-            try:
-                await vllm.wait_ready()
-            except RuntimeError:
-                # Process exited while waiting; the restart branch above
-                # applies the backoff on the next iteration.
-                logger.exception("vLLM exited before becoming ready")
-                continue
-            except TimeoutError:
-                logger.warning("vLLM still not ready; continuing to wait")
-                continue
-            backoff = 5.0
-            if settings.sync_on_startup and manager.resolve_adapter_path() is not None:
-                await manager.sync_adapter()
-        await asyncio.sleep(10.0)
-
-
-@contextlib.asynccontextmanager
-async def _lifespan(_: FastAPI):
-    manager.start()
-    supervisor = asyncio.create_task(_supervise_vllm())
-    try:
-        yield
-    finally:
-        supervisor.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await supervisor
-        await manager.stop()
-        vllm.terminate()
-
-
-app = FastAPI(title="vllm-colocate", lifespan=_lifespan)
-
-
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    return {
-        "ok": True,
-        "vllm": vllm.status(),
-    }
-
-
-@app.get("/status")
-async def status() -> dict[str, Any]:
-    vllm_status = vllm.status()
-    vllm_status["ready"] = await vllm.is_ready()
-    vllm_status["models"] = await vllm.loaded_models()
-    return {
-        "model": settings.model_name,
-        "served_model_name": settings.served_model_name,
-        "adapter_name": settings.adapter_name,
-        "gpus": {
-            "all": list(settings.all_gpus),
-            "inference": list(settings.inference_gpus),
-            "training": list(settings.training_gpus),
-            "shared": settings.gpus_shared,
-        },
-        "vllm": vllm_status,
-        "training": manager.status(),
-    }
-
-
-async def _submit_training(
-    kind: str, payload: Any, wait: bool, wait_timeout_seconds: float | None
+@train_router.post("/train/sft")
+async def train_sft(
+    payload: Any = Body(...),
+    wait: bool = Query(default=False),
+    wait_timeout_seconds: float | None = Query(default=None, ge=0),
 ) -> dict[str, Any]:
     samples = _extract_samples(payload)
     if not samples:
         raise HTTPException(status_code=400, detail="no training samples provided")
     options = _extract_options(payload)
-    job = await manager.submit(kind, samples, options)
+    job = await manager.submit(samples, options)
     if wait:
         # asyncio.wait_for already treats None as unbounded and 0 as an
         # immediate done-check.
@@ -1121,78 +867,177 @@ async def _submit_training(
     return job.payload()
 
 
-@app.post("/train/sft")
-async def train_sft(
-    payload: Any = Body(...),
-    wait: bool = Query(default=False),
-    wait_timeout_seconds: float | None = Query(default=None, ge=0),
+@train_router.get("/train/sft")
+async def train_sft_status(
+    limit: int = Query(default=20, ge=1, le=500),
 ) -> dict[str, Any]:
-    return await _submit_training("sft", payload, wait, wait_timeout_seconds)
-
-
-@app.post("/train/dpo")
-async def train_dpo(
-    payload: Any = Body(...),
-    wait: bool = Query(default=False),
-    wait_timeout_seconds: float | None = Query(default=None, ge=0),
-) -> dict[str, Any]:
-    return await _submit_training("dpo", payload, wait, wait_timeout_seconds)
-
-
-@app.post("/train/kto")
-async def train_kto(
-    payload: Any = Body(...),
-    wait: bool = Query(default=False),
-    wait_timeout_seconds: float | None = Query(default=None, ge=0),
-) -> dict[str, Any]:
-    return await _submit_training("kto", payload, wait, wait_timeout_seconds)
-
-
-@app.get("/train/jobs")
-async def train_jobs(limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
-    return {"jobs": manager.jobs_payload(limit=limit)}
-
-
-@app.get("/train/jobs/{job_id}")
-async def train_job(job_id: str) -> dict[str, Any]:
-    job = manager.jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="unknown job id")
-    return job.payload()
-
-
-@app.post("/train/jobs/{job_id}/cancel")
-async def train_job_cancel(job_id: str) -> dict[str, Any]:
-    job = await manager.cancel(job_id)
-    return job.payload()
-
-
-@app.get("/train/metrics")
-async def train_metrics(limit: int = Query(default=50, ge=1, le=1000)) -> dict[str, Any]:
-    rows = await asyncio.to_thread(_tail_jsonl, settings.metrics_path, limit=limit)
     return {
-        "metrics_path": str(settings.metrics_path),
-        "rows": rows,
-    }
-
-
-@app.get("/adapter")
-async def adapter() -> dict[str, Any]:
-    loaded_models = await vllm.loaded_models()
-    return {
+        "model": settings.model_name,
+        "served_model_name": settings.served_model_name,
         "adapter_name": settings.adapter_name,
-        "loaded": settings.adapter_name in loaded_models,
-        "active": manager.active_adapter(),
-        "latest_checkpoint": manager.latest_checkpoint(),
+        "gpus": list(settings.gpus),
+        "inference": {
+            "in_flight": InFlightGate.in_flight,
+            "busy": InFlightGate.busy(settings.idle_grace_seconds),
+            "idle_grace_seconds": settings.idle_grace_seconds,
+        },
+        "training": manager.status(),
+        "jobs": manager.jobs_payload(limit=limit),
+        "metrics": await asyncio.to_thread(
+            _tail_jsonl, settings.metrics_path, limit=20
+        ),
     }
 
 
-@app.post("/adapter/sync")
-async def adapter_sync() -> dict[str, Any]:
-    result = await manager.sync_adapter()
-    if not result.get("ok"):
-        raise HTTPException(status_code=409, detail=result)
-    return result
+# ----------------------------------------------------------------- launcher
+
+
+def _import_vllm_server() -> tuple[Any, Any, Any, Any]:
+    """Import vLLM's server machinery across the entrypoints restructure.
+
+    Returns ``(entry, cli_args, FlexibleArgumentParser, legacy_api_server)``
+    where ``entry`` owns ``run_server`` and ``build_app``; ``legacy_api_server``
+    is the old module carrying the module-level router, or None on new vLLM.
+    """
+    try:
+        from vllm.entrypoints.launchers import cli_args
+        from vllm.entrypoints.launchers.api_server import entry
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+        return entry, cli_args, FlexibleArgumentParser, None
+    except ImportError:
+        import vllm.entrypoints.openai.api_server as legacy
+        from vllm.entrypoints.openai import cli_args
+
+        try:
+            from vllm.utils.argparse_utils import FlexibleArgumentParser
+        except ImportError:
+            from vllm.utils import FlexibleArgumentParser
+
+        return legacy, cli_args, FlexibleArgumentParser, legacy
+
+
+def _install_train_routes(entry: Any, legacy: Any) -> None:
+    if legacy is not None:
+        # Old layout: build_app() includes the module-level router, so routes
+        # added to it before the server starts ride along.
+        legacy.router.include_router(train_router)
+        return
+    # New layout: no module-level router. build_and_serve resolves build_app
+    # from the entry module's globals at call time, so wrapping it there is
+    # honored.
+    original_build_app = entry.build_app
+
+    def build_app_with_training(args: Any, *extra: Any, **kwargs: Any) -> Any:
+        app = original_build_app(args, *extra, **kwargs)
+        app.include_router(train_router)
+        return app
+
+    entry.build_app = build_app_with_training
+
+
+def _build_vllm_argv() -> list[str]:
+    """Compose the vllm serve argv: our defaults first, then env extra args,
+    then this process's CLI args — so explicit user flags always win."""
+    argv = [
+        "--host",
+        settings.host,
+        "--port",
+        str(settings.port),
+        "--gpu-memory-utilization",
+        str(settings.gpu_memory_utilization),
+        "--served-model-name",
+        settings.served_model_name,
+        "--max-loras",
+        str(settings.max_loras),
+        "--max-lora-rank",
+        str(settings.max_lora_rank),
+    ]
+    if settings.tensor_parallel_size > 1:
+        argv.extend(
+            ["--tensor-parallel-size", str(settings.tensor_parallel_size)]
+        )
+    if settings.trust_remote_code:
+        argv.append("--trust-remote-code")
+    if settings.max_model_len:
+        argv.extend(["--max-model-len", str(settings.max_model_len)])
+    if settings.max_num_seqs:
+        argv.extend(["--max-num-seqs", str(settings.max_num_seqs)])
+    if settings.vllm_extra_args:
+        argv.extend(shlex.split(settings.vllm_extra_args))
+    argv.extend(sys.argv[1:])
+    return argv
+
+
+def _parse_vllm_args(cli_args: Any, parser_cls: Any) -> Any:
+    parser = cli_args.make_arg_parser(
+        parser_cls(description="vLLM inference + colocated SFT LoRA training")
+    )
+    argv = _build_vllm_argv()
+    args = parser.parse_args(argv)
+    model_flag_given = any(
+        part == "--model" or part.startswith("--model=") for part in argv
+    )
+    if getattr(args, "model_tag", None):
+        args.model = args.model_tag
+    elif not model_flag_given:
+        # No model on the command line: use the env setting instead of
+        # vLLM's placeholder default.
+        args.model = settings.model_name
+    if getattr(args, "headless", False):
+        raise SystemExit(
+            "--headless runs no API server, so the /train/sft route cannot "
+            "exist; remove the flag."
+        )
+    # The training route, the in-flight gate, and runtime LoRA updates all
+    # need the one in-process API server.
+    if getattr(args, "api_server_count", None) not in (None, 1):
+        logger.warning("Forcing --api-server-count 1 (was %s)", args.api_server_count)
+        args.api_server_count = 1
+    args.enable_lora = True
+    middleware = list(getattr(args, "middleware", None) or [])
+    middleware.append(f"{__name__}.InFlightGate")
+    args.middleware = middleware
+    validate = getattr(cli_args, "validate_parsed_serve_args", None)
+    if validate is not None:
+        validate(args)
+    _reconcile_network_settings(args)
+    return args
+
+
+def _reconcile_network_settings(args: Any) -> None:
+    """The user may override --host/--port through CLI passthrough or extra
+    args; the self-calls (health poll, adapter loads) must follow."""
+    global settings
+    host = getattr(args, "host", None) or settings.host
+    port = int(getattr(args, "port", None) or settings.port)
+    if (host, port) != (settings.host, settings.port):
+        settings = replace(settings, host=host, port=port)
+        manager.settings = settings
+
+
+async def _startup() -> None:
+    """Runs on the server's event loop: start the manager, then restore the
+    last trained adapter once vLLM answers /health."""
+    manager.start()
+    if not settings.sync_on_startup:
+        return
+    if not await manager.wait_server_ready(settings.ready_timeout_seconds):
+        logger.warning("vLLM never became ready; skipping adapter restore")
+        return
+    if manager.resolve_adapter_path() is not None:
+        await manager.sync_adapter()
+
+
+async def _serve(entry: Any, args: Any) -> None:
+    startup = asyncio.get_running_loop().create_task(_startup())
+    try:
+        await entry.run_server(args)
+    finally:
+        startup.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await startup
+        await manager.stop()
 
 
 def main() -> None:
@@ -1200,25 +1045,34 @@ def main() -> None:
         level=os.getenv("VLLM_COLOCATE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    logger.info(
-        "GPU partition: all=[%s] inference=[%s] training=[%s]%s",
-        ",".join(settings.all_gpus) or "-",
-        ",".join(settings.inference_gpus) or "-",
-        ",".join(settings.training_gpus) or "-",
-        " (single GPU shared between inference and training)"
-        if settings.gpus_shared
-        else "",
-    )
-    if not settings.all_gpus:
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    # A pause file left behind by a previous run would stall the trainer.
+    with contextlib.suppress(OSError):
+        settings.pause_file.unlink(missing_ok=True)
+    if not settings.gpus:
         logger.warning(
             "No GPUs detected; starting anyway (vLLM will decide device placement)"
         )
-    uvicorn.run(
-        app,
-        host=settings.api_host,
-        port=settings.api_port,
-        log_level=os.getenv("VLLM_COLOCATE_UVICORN_LOG_LEVEL", "info"),
+    entry, cli_args, parser_cls, legacy = _import_vllm_server()
+    _install_train_routes(entry, legacy)
+    args = _parse_vllm_args(cli_args, parser_cls)
+    logger.info(
+        "Serving %s on %s:%s (GPUs [%s] shared between inference and training)",
+        args.model,
+        settings.host,
+        settings.port,
+        ",".join(settings.gpus) or "-",
     )
+    try:
+        import uvloop
+
+        runner = uvloop.run
+    except ImportError:
+        runner = asyncio.run
+    try:
+        runner(_serve(entry, args))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
