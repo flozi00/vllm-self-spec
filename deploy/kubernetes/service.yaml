@@ -1,0 +1,38 @@
+# Cluster-internal endpoint for inference clients.
+#
+# Keep this a ClusterIP. The port carries both the OpenAI API and the
+# unauthenticated POST /train/sft route, so anything that can reach it can
+# queue training jobs. See docs/kubernetes.md ("Exposure and access control").
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-colocate
+  labels:
+    app.kubernetes.io/name: vllm-colocate
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vllm-colocate
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+# Headless service backing the StatefulSet's stable pod DNS name:
+# vllm-colocate-0.vllm-colocate-headless.vllm-colocate.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-colocate-headless
+  labels:
+    app.kubernetes.io/name: vllm-colocate
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: vllm-colocate
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

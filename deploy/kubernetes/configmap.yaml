@@ -1,0 +1,47 @@
+# Tunables for the colocated server. Every key is read by the launcher at
+# startup (see the configuration reference in the README), so changing a value
+# needs a pod restart:
+#
+#   kubectl -n vllm-colocate rollout restart statefulset/vllm-colocate
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-colocate-config
+  labels:
+    app.kubernetes.io/name: vllm-colocate
+data:
+  # ---------------------------------------------------------------- model
+  VLLM_COLOCATE_MODEL: "Qwen/Qwen3-8B"
+  # Adapter is served as "<served model name>-lora"; both names show up in
+  # GET /v1/models once the first job has finished.
+  # VLLM_COLOCATE_SERVED_MODEL_NAME: "Qwen/Qwen3-8B"
+
+  # ------------------------------------------------------------- serving
+  VLLM_COLOCATE_HOST: "0.0.0.0"
+  VLLM_COLOCATE_PORT: "8000"
+  # vLLM takes this fraction of each GPU; the rest is the trainer's headroom.
+  # Raising it grows the KV cache and shrinks what training has left.
+  VLLM_COLOCATE_GPU_MEMORY_UTILIZATION: "0.45"
+  # Without this the model's full context is reserved, which is usually far
+  # more KV cache than a colocated setup can afford.
+  VLLM_COLOCATE_MAX_MODEL_LEN: "8192"
+  # Extra `vllm serve` flags (CLI args on the container also work).
+  # VLLM_COLOCATE_VLLM_EXTRA_ARGS: "--max-num-batched-tokens 8192"
+
+  # ------------------------------------------------------------ training
+  # Inference must be idle this long before the trainer takes a step.
+  VLLM_COLOCATE_IDLE_GRACE_SECONDS: "5"
+  VLLM_COLOCATE_DATA_DIR: "/data/vllm_colocate"
+  # Steps between adapter exports; every export that advances the step is
+  # hot-swapped into the running server.
+  VLLM_COLOCATE_CHECKPOINT_EVERY: "16"
+  VLLM_COLOCATE_KEEP_LAST_CHECKPOINTS: "2"
+  VLLM_COLOCATE_MAX_SEQ_LEN: "2048"
+  VLLM_COLOCATE_LOG_LEVEL: "INFO"
+
+  # -------------------------------------------------------------- caches
+  # Keep every cache on a volume, otherwise each restart re-downloads the
+  # weights and recompiles the graphs into the pod's ephemeral filesystem.
+  HF_HOME: "/hf-cache"
+  VLLM_CACHE_ROOT: "/data/vllm_colocate/vllm-cache"
+  TRITON_CACHE_DIR: "/data/vllm_colocate/triton-cache"

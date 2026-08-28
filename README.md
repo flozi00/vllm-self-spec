@@ -70,13 +70,21 @@ docker run --rm --gpus all --ipc=host --shm-size 16g \
   -e VLLM_COLOCATE_MODEL=Qwen/Qwen3-8B \
   --entrypoint /bin/bash \
   vllm/vllm-openai:latest \
-  -lc 'git clone --depth 1 --branch main https://github.com/flozi00/vllm-self-spec.git /opt/vllm_colocate &&
-       python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
-         "fastapi>=0.115.0" "httpx>=0.28.0" \
-         "huggingface_hub>=0.20.0" "safetensors>=0.4.0" &&
+  -lc 'mkdir -p /opt/vllm_colocate &&
+       curl -fsSL https://github.com/flozi00/vllm-self-spec/archive/refs/heads/main.tar.gz |
+         tar -xz --strip-components=1 -C /opt/vllm_colocate &&
        export PYTHONPATH=/opt &&
        exec python -m vllm_colocate.app'
 ```
+
+The image needs no extra packages: `fastapi`, `httpx`, `huggingface_hub`,
+`safetensors`, `transformers` and `torch` all ship with `vllm/vllm-openai`
+already. (A tarball rather than `git clone` — the official image installs
+`curl` but not `git`.)
+
+More ways to run it on the stock image — bind mounts, non-root, version
+pinning, troubleshooting — are in
+[docs/serving-with-official-vllm-images.md](docs/serving-with-official-vllm-images.md).
 
 Any extra command-line arguments are passed straight to vLLM's own `serve`
 parser, so this behaves like `vllm serve` with one additional route:
@@ -89,6 +97,26 @@ Explicit flags win over the launcher's defaults. The launcher pins the things
 the training route needs: `--enable-lora` is always on, runtime LoRA updating
 is enabled, and `--api-server-count` stays at 1 (the route, the idle gate, and
 runtime LoRA all need the single in-process API server).
+
+## Kubernetes
+
+Ready-to-apply manifests for the official image live in
+[deploy/kubernetes/](deploy/kubernetes), with the walkthrough in
+[docs/kubernetes.md](docs/kubernetes.md):
+
+```shell
+kubectl apply -f deploy/kubernetes/namespace.yaml
+
+kubectl -n vllm-colocate create configmap vllm-colocate-src \
+  --from-file=__init__.py --from-file=app.py --from-file=lora_trainer.py
+
+kubectl apply -k deploy/kubernetes/
+```
+
+One pod, one GPU set, one port: the plugin's three files ride into the stock
+`vllm/vllm-openai` image as a ConfigMap, checkpoints and adapters live on a
+PVC. It is a single-replica workload by design — the docs explain why, and
+what to do instead when you need to scale.
 
 ## Inference
 
