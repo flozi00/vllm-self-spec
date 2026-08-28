@@ -1,0 +1,159 @@
+# One pod: stock vLLM image + the plugin's three Python files on PYTHONPATH.
+#
+# A StatefulSet rather than a Deployment because this workload owns state that
+# must not be shared or duplicated: the LoRA checkpoints and the job queue live
+# on the pod's data volume, and the GPU is held exclusively. At one replica the
+# StatefulSet also guarantees the old pod is gone (GPU released) before the new
+# one is scheduled — a Deployment would need `strategy: Recreate` to match.
+#
+# Do not scale this above 1. See docs/kubernetes.md ("Why a single replica").
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm-colocate
+  labels:
+    app.kubernetes.io/name: vllm-colocate
+spec:
+  replicas: 1
+  serviceName: vllm-colocate-headless
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-colocate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm-colocate
+    spec:
+      # Drain the current generation, let the launcher stop the trainer
+      # subprocess and flush the pause file.
+      terminationGracePeriodSeconds: 120
+
+      # Adjust to your cluster's GPU node labels and taints.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      containers:
+        - name: server
+          # `latest` moves under you: pin a released tag before production, so
+          # a pod restart cannot silently change the engine version.
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+
+          # Replaces the image's ENTRYPOINT ["vllm", "serve"]. The launcher
+          # runs vLLM's own server in-process and attaches POST /train/sft to
+          # the same app on the same port.
+          command: ["python", "-m", "vllm_colocate.app"]
+          # Anything here goes straight to vLLM's `serve` parser and wins over
+          # the launcher's defaults, e.g.:
+          # args: ["--max-num-seqs", "64", "--enable-auto-tool-choice"]
+          args: []
+
+          env:
+            # The plugin source is mounted at /opt/vllm_colocate, so /opt is
+            # what makes `vllm_colocate` importable.
+            - name: PYTHONPATH
+              value: /opt
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # Only needed for gated or private models.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface
+                  key: HF_TOKEN
+                  optional: true
+          envFrom:
+            - configMapRef:
+                name: vllm-colocate-config
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          volumeMounts:
+            - name: plugin-src
+              mountPath: /opt/vllm_colocate
+              readOnly: true
+            - name: data
+              mountPath: /data/vllm_colocate
+            - name: hf-cache
+              mountPath: /hf-cache
+            # vLLM's workers talk over shared memory; the container default of
+            # 64Mi is far too small. This is the `--shm-size` of `docker run`.
+            - name: dshm
+              mountPath: /dev/shm
+
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              # Whole GPUs only — the trainer needs the VRAM vLLM did not take,
+              # which MIG slices and time-slicing cannot guarantee.
+              nvidia.com/gpu: "1"
+              # The trainer subprocess counts against this limit too. An OOM
+              # kill takes down inference with it, so leave real headroom.
+              memory: 64Gi
+
+          # Weight download plus engine startup can take a long time on a cold
+          # cache; the startup probe is what buys that time. Liveness and
+          # readiness only apply once it has passed.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 180
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+
+      volumes:
+        # The plugin itself: three files, no build step. Create it with
+        #   kubectl -n vllm-colocate create configmap vllm-colocate-src \
+        #     --from-file=__init__.py --from-file=app.py --from-file=lora_trainer.py
+        # See docs/kubernetes.md for the git-clone and custom-image variants.
+        - name: plugin-src
+          configMap:
+            name: vllm-colocate-src
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
+  volumeClaimTemplates:
+    # Checkpoints, exported adapters, per-job sample files, trainer metrics.
+    # Losing this volume means losing everything the model has been taught.
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+    # Hugging Face model cache. Sized for the base weights plus room to grow;
+    # swap it for a shared read-write-many claim if several deployments should
+    # share one cache (see docs/kubernetes.md).
+    - metadata:
+        name: hf-cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 200Gi

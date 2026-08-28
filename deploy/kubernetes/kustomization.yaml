@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: vllm-colocate
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - service.yaml
+  - statefulset.yaml
+  # — poddisruptionbudget.yaml
+  # — secret.example.yaml       # prefer `kubectl create secret generic huggingface ...`
+  # — ingress.example.yaml      # read the security notes first
+
+# The plugin source ConfigMap (vllm-colocate-src) is created out of band from
+# the repository checkout — see docs/kubernetes.md:
+#
+#   kubectl -n vllm-colocate create configmap vllm-colocate-src \
+#     --from-file=__init__.py --from-file=app.py --from-file=lora_trainer.py
+
+# Pin the engine version here rather than editing the StatefulSet:
+# images:
+#   - name: vllm/vllm-openai
+#     newTag: v0.0.0

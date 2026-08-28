@@ -1,0 +1,32 @@
+# EXAMPLE ONLY — not part of kustomization.yaml. Read the security notes in
+# docs/kubernetes.md before exposing this workload outside the cluster.
+#
+# The one rule that matters: only /v1 is routed. vLLM's --api-key middleware
+# guards paths under /v1, /v2, /inference and /cohere — it does not guard
+# /train/sft. Publishing the whole port hands anyone who can reach it the
+# ability to queue training jobs against your model.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vllm-colocate
+  labels:
+    app.kubernetes.io/name: vllm-colocate
+  annotations:
+    # Streaming responses must not be buffered by the proxy.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Generations outlive the default 60s read timeout.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: llm.example.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: vllm-colocate
+                port:
+                  name: http

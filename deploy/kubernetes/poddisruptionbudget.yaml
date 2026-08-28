@@ -1,0 +1,20 @@
+# Optional. At one replica this blocks *all* voluntary evictions: a node drain
+# or a cluster-autoscaler scale-down will wait for a human instead of killing a
+# running training job mid-step.
+#
+# That is the point, and also the cost — node upgrades stall until you delete
+# the pod yourself. Leave it out if unattended drains matter more than an
+# interrupted job (checkpoints are written every
+# VLLM_COLOCATE_CHECKPOINT_EVERY steps, so an interrupted job loses at most the
+# steps since the last export).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm-colocate
+  labels:
+    app.kubernetes.io/name: vllm-colocate
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-colocate
