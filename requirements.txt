@@ -1,6 +1,6 @@
+# vllm itself (and its torch build) comes from the vllm/vllm-openai base image.
 fastapi>=0.115.0
 httpx>=0.28.0
-uvicorn>=0.34.0
 huggingface_hub>=0.20.0
 safetensors>=0.4.0
 transformers>=5.5.0

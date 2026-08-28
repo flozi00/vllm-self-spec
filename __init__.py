@@ -1,1 +1,1 @@
-"""Colocated vLLM inference and LoRA training in one container."""
+"""vLLM inference with a colocated SFT LoRA training route on the same port."""

@@ -8,7 +8,6 @@ WORKDIR /opt
 RUN python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
     "fastapi>=0.115.0" \
     "httpx>=0.28.0" \
-    "uvicorn>=0.34.0" \
     "huggingface_hub>=0.20.0" \
     "safetensors>=0.4.0"
 
@@ -20,8 +19,7 @@ COPY lora_trainer.py /opt/vllm_colocate/
 
 ENV PYTHONPATH=/opt
 
-# 8000: vLLM OpenAI-compatible inference (served directly, no proxy)
-# 8001: training / weight-sync control plane
-EXPOSE 8000 8001
+# 8000: vLLM OpenAI-compatible inference + the /train/sft route, one port
+EXPOSE 8000
 
 ENTRYPOINT ["python", "-m", "vllm_colocate.app"]
